@@ -70,7 +70,7 @@ namespace Client
             // 连接成功后启动心跳
             StartHeartbeat();
             StartReceiveProcessing();
-            //StartCheckResends();
+            StartCheckResends();
             _isConnected = true;
             _heartbeatCountout = 0;
         }
@@ -123,7 +123,7 @@ namespace Client
                             Interlocked.Exchange(ref _isHeartAck, 1); // 原子操作
                             try
                             {
-                                await ProcessReceivedData(data);
+                                ProcessReceivedData(data);
                             }
                             catch (Exception ex)
                             {
@@ -140,6 +140,40 @@ namespace Client
                     Disconnect();
                 }
             }, _receiveCts.Token);
+        }
+
+        private void ProcessReceivedData(CommunicationData data)
+        {
+            // 处理乱序包
+            if (data.SeqNum == _nextExpectedSeq)
+            {
+                // 按序到达：提交数据并移动接收窗口
+                Console.WriteLine($"Received Seq={data.SeqNum}");
+                _receiveBuffer.Remove(data.SeqNum);
+                _nextExpectedSeq++;
+                _pendingMessages.Remove(data.SeqNum);
+                // 触发窗口滑动
+                lock (_sendLock)
+                {
+                    while (_sendWindow.Count > 0 &&
+                           _sendWindow.Peek() < _nextExpectedSeq)
+                    {
+                        _sendWindow.Dequeue();
+                        Monitor.Pulse(_sendLock); // 通知发送线程窗口可用
+                    }
+                }
+            }
+            if (data.SeqNum > _nextExpectedSeq)
+            {
+                // 乱序包暂存
+                _receiveBuffer[data.SeqNum] = data;
+                Console.WriteLine($"Buffered Seq={data.SeqNum}");
+            }
+
+            if(data.SeqNum < _nextExpectedSeq)
+            {
+                _pendingMessages.Remove(data.SeqNum);
+            }
         }
 
         private void StartHeartbeat()
@@ -243,34 +277,7 @@ namespace Client
 
             await _clientSocket.SendAsync(fullPacket, SocketFlags.None);
         }
-        private async Task ProcessReceivedData(CommunicationData data)
-        {
-            // 处理乱序包
-            if (data.SeqNum == _nextExpectedSeq)
-            {
-                // 按序到达：提交数据并移动接收窗口
-                Console.WriteLine($"Received Seq={data.SeqNum}");
-                _receiveBuffer.Remove(data.SeqNum);
-                _nextExpectedSeq++;
-                _pendingMessages.Remove(data.SeqNum);
-                // 触发窗口滑动
-                lock (_sendLock)
-                {
-                    while (_sendWindow.Count > 0 &&
-                           _sendWindow.Peek() < _nextExpectedSeq)
-                    {
-                        _sendWindow.Dequeue();
-                        Monitor.Pulse(_sendLock); // 通知发送线程窗口可用
-                    }
-                }
-            }
-            if (data.SeqNum > _nextExpectedSeq)
-            {
-                // 乱序包暂存
-                _receiveBuffer[data.SeqNum] = data;
-                Console.WriteLine($"Buffered Seq={data.SeqNum}");
-            }
-        }
+        
         // 修改 ReceiveData 方法
         public async Task<CommunicationData> ReceiveData(CancellationToken token)
         {
