@@ -26,6 +26,7 @@ public class Date
     public CommunicationData communicationData { get; set; }
     public int RetryCount { get; set; } = 0;      // 新增重试计数器
     public DateTime FirstSentTime { get; set; }   // 新增首次发送时间
+    public bool IsAck { get; set; }
 }
 public class FileChunk
 {

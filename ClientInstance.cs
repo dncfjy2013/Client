@@ -1,4 +1,6 @@
 ﻿using Client.Common;
+using Client.Common.Log;
+using Client.utils;
 using Microsoft.VisualBasic;
 using System;
 using System.Collections.Concurrent;
@@ -19,19 +21,12 @@ namespace Client
         private readonly string _serverIp;
         private readonly int _port;
         private Socket _clientSocket;
-        private System.Timers.Timer _heartbeatTimer; // 新增心跳定时器
-        //private readonly object _sendLock = new object(); // 发送锁保证线程安全
         private bool _isConnected = false;
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
-        private readonly SemaphoreSlim _heartbeatSendLock = new SemaphoreSlim(1, 1);
-        private int _currentSeq = 1; // 当前发送序列号
-        private int _expectedAck = 1; // 期望确认号
+        private int _currentSeq = 0; // 当前发送序列号
         private readonly Dictionary<int, Date> _pendingMessages = new();
-        private readonly System.Timers.Timer _resendTimer; // 新增重传定时器
-
-        // 修改后的心跳相关代码片段
-        private readonly SemaphoreSlim _heartbeatLock = new SemaphoreSlim(1, 1);
-        private int _heartbeatCountout = 0;
+        private readonly Logger logger = Logger.GetInstance();
+        private int _heartbeatCountout;
         // 新增文件传输相关字段
         private readonly ConcurrentDictionary<string, FileTransferState> _activeTransfers = new();
         private readonly object _transferLock = new object();
@@ -39,16 +34,21 @@ namespace Client
         private readonly SemaphoreSlim _transferSemaphore = new SemaphoreSlim(1, 1);
         private bool _skipNextHeartbeat = false;
 
-        private readonly Queue<int> _sendWindow = new Queue<int>();
-        private const int WindowSize = 100; // 窗口大小可配置
+        private const int WindowSize = 1000; // 窗口大小
+        private readonly Queue<int> _sendWindow = new Queue<int>(); // 发送窗口队列
+        private int _nextExpectedSeq = 1; // 下一个期望接收的序列号
+        private readonly Dictionary<int, CommunicationData> _receiveBuffer = new(); // 接收缓冲区
+        private int _isHeartAck = 0;
+        private CancellationTokenSource _receiveCts;
+        private CancellationTokenSource _heartbeatCts;
+        private const int HeartbeatIntervalMs = 3000;
+        private const int AckTimeoutMs = 1000; // 原逻辑10*10ms=100ms，建议延长
+        private const int MaxMissedHeartbeats = 3; // 原100次约5分钟，建议缩短
 
         public ClientInstance(string serverIp, int port)
         {
             _serverIp = serverIp;
             _port = port;
-
-            _resendTimer = new System.Timers.Timer(1000); // 每秒检查重传
-            _resendTimer.Elapsed += CheckResends;
         }
 
         public async Task Connect()
@@ -69,126 +69,166 @@ namespace Client
             }
             // 连接成功后启动心跳
             StartHeartbeat();
+            StartReceiveProcessing();
+            //StartCheckResends();
             _isConnected = true;
-
-            _resendTimer.Start(); // 启动重传检查定时器
+            _heartbeatCountout = 0;
         }
         // 新增重传检查方法
-        private async void CheckResends(object sender, EventArgs e)
+        private void StartCheckResends()
         {
-            var now = DateTime.Now;
-            var toResend = _pendingMessages
-                .Where(p => (now - p.Value.FirstSentTime).TotalMilliseconds >
-                           (p.Value.RetryCount + 1) * 5000)
-                .ToList();
+            Task.Run(async () =>
+            {
+                while (!_isConnected)
+                {
+                    await Task.Delay(1000);
 
-            foreach (var item in toResend)
+                    const int MaxRetries = 5;
+                    var now = DateTime.Now;
+                    var toResend = _pendingMessages
+                        .Where(p => p.Value.RetryCount < MaxRetries &&
+                                   (now - p.Value.FirstSentTime).TotalMilliseconds >
+                                   Math.Pow(2, p.Value.RetryCount) * 1000 && p.Value.communicationData.SeqNum > _nextExpectedSeq)
+                        .ToList();
+
+                    foreach (var item in toResend)
+                    {
+                        try
+                        {
+                            Console.WriteLine($"Resending SeqNum={item.Key}");
+                            await SendRawData(item.Value.communicationData);
+                            item.Value.RetryCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            HandleSendFailure(ex, item.Value.communicationData);
+                        }
+                    }
+                }
+            });
+        }
+
+        private void StartReceiveProcessing()
+        {
+            _receiveCts = new CancellationTokenSource();
+            Task.Run(async () =>
             {
                 try
                 {
-                    Console.WriteLine($"Resending SeqNum={item.Key} (Attempt {item.Value.RetryCount + 1})");
-                    await SendRawData(item.Value.communicationData);
-                    item.Value.RetryCount++;
-                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                    var ack = await Task.Run(() => ReceiveRawData(cts.Token));
-                    if(ack!= null && ack.InfoType != InfoType.HeartBeat)
+                    while (!_receiveCts.IsCancellationRequested)
                     {
-                        _pendingMessages.Remove(ack.AckNum);
+                        var data = await ReceiveData(_receiveCts.Token);
+                        if (data != null)
+                        {
+                            Interlocked.Exchange(ref _isHeartAck, 1); // 原子操作
+                            try
+                            {
+                                await ProcessReceivedData(data);
+                            }
+                            catch (Exception ex)
+                            {
+                                logger.LogTemp(LogLevel.Error, "Data processing failed");
+                            }
+                        }
+                        await Task.Delay(100, _receiveCts.Token);
                     }
                 }
+                catch (OperationCanceledException) { /* 正常取消 */ }
                 catch (Exception ex)
                 {
-                    HandleSendFailure(ex, item.Value.communicationData);
+                    logger.LogTemp(LogLevel.Error, "Receive loop terminated unexpectedly");
+                    Disconnect();
                 }
-            }
+            }, _receiveCts.Token);
         }
+
         private void StartHeartbeat()
         {
-            // 设置心跳间隔（示例为3秒）
-            _heartbeatTimer = new System.Timers.Timer(3000);
-            _heartbeatTimer.Elapsed += (sender, e) => SendHeartbeatAsync();
-            _heartbeatTimer.AutoReset = true;
-            _heartbeatTimer.Start();
-        }
-
-        private async void SendHeartbeatAsync()
-        {
-            if (!_isConnected || _skipNextHeartbeat) 
+            _heartbeatCts = new CancellationTokenSource();
+            Task.Run(async () =>
             {
-                _skipNextHeartbeat = false;
-                return; 
-            }
-
-            try
-            {
-                await _heartbeatLock.WaitAsync();
-
-                var heartbeatData = new CommunicationData
+                try
                 {
-                    Message = "Heartbeat",
-                    InfoType = InfoType.HeartBeat,
-                };
-
-                // 通过统一发送接口发送心跳包
-                await SendRawData(heartbeatData);
-
-                // 使用独立定时器等待ACK（避免阻塞主线程）
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                var ack = await Task.Run(() => ReceiveRawData(cts.Token));
-                
-                if(ack == null)
-                {
-                    _heartbeatCountout++;
-                    if (_heartbeatCountout > 100)
+                    while (!_heartbeatCts.IsCancellationRequested)
                     {
-                        Console.WriteLine($"server is not avalable");
+                        await Task.Delay(HeartbeatIntervalMs, _heartbeatCts.Token);
+
+                        if (_skipNextHeartbeat)
+                        {
+                            _skipNextHeartbeat = false;
+                            continue;
+                        }
+
+                        var heartbeatData = new CommunicationData
+                        {
+                            Message = "Heartbeat",
+                            InfoType = InfoType.HeartBeat,
+                        };
+
+                        await SendData(heartbeatData);
+                        Interlocked.Exchange(ref _isHeartAck, 0);
+
+                        var ackTimeout = Task.Delay(AckTimeoutMs, _heartbeatCts.Token);
+                        Task ackReceived = await Task.WhenAny(
+                            Task.Run(() => _isHeartAck == 1), // 等待确认标志
+                            ackTimeout
+                        );
+
+                        if (!ackReceived.IsCompleted)
+                        {
+                            Interlocked.Increment(ref _heartbeatCountout);
+                            if (_heartbeatCountout >= MaxMissedHeartbeats)
+                            {
+                                Disconnect();
+                                _heartbeatCts.Cancel();
+                            }
+                        }
+                        else
+                        {
+                            Interlocked.Exchange(ref _heartbeatCountout, 0);
+                        }
                     }
                 }
-            }
-            finally
-            {
-                _heartbeatLock.Release();
-            }
+                catch (OperationCanceledException) { /* 正常取消 */ }
+                catch (Exception ex)
+                {
+                    Disconnect();
+                    _heartbeatCts.Cancel();
+                }
+            }, _heartbeatCts.Token);
         }
 
         public async Task SendData(CommunicationData data)
         {
-            // 使用独立信号量保证心跳包发送优先级
-            SemaphoreSlim lockToTake = data.InfoType == InfoType.HeartBeat
-                ? _heartbeatSendLock
-                : _sendLock;
-            if(data.InfoType != InfoType.HeartBeat)
+            // 窗口控制逻辑
+            lock (_sendLock)
             {
-                if(!_pendingMessages.TryGetValue(data.SeqNum, out _))
+                while (_sendWindow.Count >= WindowSize)
                 {
-                    Date date = new Date() { communicationData = data, FirstSentTime = DateTime.Now, RetryCount = 0 };
-                    _pendingMessages.Add(data.SeqNum, date);
-                }
-                data.SeqNum = _currentSeq;
-                _currentSeq++;
-            }
-            await lockToTake.WaitAsync();
-            try
-            {
-                await SendRawData(data);
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                var ack = await Task.Run(() => ReceiveRawData(cts.Token));
-                if(ack != null)
-                {
-                    if (data.InfoType == InfoType.HeartBeat)
+                    // 添加超时机制
+                    if (!Monitor.Wait(_sendLock, TimeSpan.FromSeconds(10)))
                     {
-                        Console.WriteLine($"Sent: {data.InfoType}");
+                        throw new TimeoutException("Send window blocked");
                     }
-                    else
-                        Console.WriteLine($"Sent: {data.InfoType}, Seq={data.SeqNum}, Ack={ack.AckNum}");
                 }
 
-                _skipNextHeartbeat = true;
+                data.SeqNum = Interlocked.Increment(ref _currentSeq);
+                _pendingMessages[data.SeqNum] = new Date
+                {
+                    communicationData = data,
+                    FirstSentTime = DateTime.Now,
+                    RetryCount = 0
+                };
+
+                _sendWindow.Enqueue(data.SeqNum);
             }
-            finally
+
+            // 异步发送（无需等待ACK即可继续发送窗口内数据）
+            _ = Task.Run(async () =>
             {
-                lockToTake.Release();
-            }
+                await SendRawData(data);
+                Console.WriteLine($"Sent: {data.InfoType}, Seq={data.SeqNum}");
+            });
         }
         private async Task SendRawData(CommunicationData data)
         {
@@ -202,6 +242,34 @@ namespace Client
             Buffer.BlockCopy(payload, 0, fullPacket, lengthPrefix.Length, payload.Length);
 
             await _clientSocket.SendAsync(fullPacket, SocketFlags.None);
+        }
+        private async Task ProcessReceivedData(CommunicationData data)
+        {
+            // 处理乱序包
+            if (data.SeqNum == _nextExpectedSeq)
+            {
+                // 按序到达：提交数据并移动接收窗口
+                Console.WriteLine($"Received Seq={data.SeqNum}");
+                _receiveBuffer.Remove(data.SeqNum);
+                _nextExpectedSeq++;
+                _pendingMessages.Remove(data.SeqNum);
+                // 触发窗口滑动
+                lock (_sendLock)
+                {
+                    while (_sendWindow.Count > 0 &&
+                           _sendWindow.Peek() < _nextExpectedSeq)
+                    {
+                        _sendWindow.Dequeue();
+                        Monitor.Pulse(_sendLock); // 通知发送线程窗口可用
+                    }
+                }
+            }
+            if (data.SeqNum > _nextExpectedSeq)
+            {
+                // 乱序包暂存
+                _receiveBuffer[data.SeqNum] = data;
+                Console.WriteLine($"Buffered Seq={data.SeqNum}");
+            }
         }
         // 修改 ReceiveData 方法
         public async Task<CommunicationData> ReceiveData(CancellationToken token)
@@ -419,16 +487,10 @@ namespace Client
         {
             _isConnected = false;
 
-            // 停止所有定时器
-            _heartbeatTimer?.Stop();
-            _resendTimer?.Stop(); // 新增停止重传定时器
-
-            // 清理资源
-            _heartbeatTimer?.Dispose();
-
             // 清除所有待处理消息
             _pendingMessages.Clear();
-
+            _receiveCts?.Cancel();
+            _heartbeatCts?.Cancel();
             // 安全关闭socket
             try
             {
@@ -437,6 +499,7 @@ namespace Client
             catch (SocketException) { /* 忽略关闭异常 */ }
             finally
             {
+                _clientSocket?.Dispose();
                 _clientSocket?.Close();
             }
 

@@ -1,7 +1,6 @@
 ﻿using Client;
 
-var manager = new ClientManager(clientCount: 10, maxConcurrent: 100);
-await manager.StartClientsAsync("127.0.0.1", 12345);
+StressTester.Main();
 
 
 //var client = new ClientInstance("127.0.0.1", 12345);
