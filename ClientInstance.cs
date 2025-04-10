@@ -50,10 +50,20 @@ namespace Client
 
         public async Task Connect()
         {
-            _clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            await _clientSocket.ConnectAsync(new IPEndPoint(IPAddress.Parse(_serverIp), _port));
-            Console.WriteLine($"Connected to server at {_serverIp}:{_port}");
-
+            while (true)
+            {
+                try
+                {
+                    _clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                    await _clientSocket.ConnectAsync(new IPEndPoint(IPAddress.Parse(_serverIp), _port));
+                    Console.WriteLine($"Connected to server at {_serverIp}:{_port}");
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"server not at {_serverIp}:{_port}");
+                }
+            }
             // 连接成功后启动心跳
             StartHeartbeat();
             _isConnected = true;
