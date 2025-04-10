@@ -39,12 +39,15 @@ namespace Client
         private readonly SemaphoreSlim _transferSemaphore = new SemaphoreSlim(1, 1);
         private bool _skipNextHeartbeat = false;
 
+        private readonly Queue<int> _sendWindow = new Queue<int>();
+        private const int WindowSize = 100; // 窗口大小可配置
+
         public ClientInstance(string serverIp, int port)
         {
             _serverIp = serverIp;
             _port = port;
 
-            _resendTimer = new System.Timers.Timer(3000); // 每秒检查重传
+            _resendTimer = new System.Timers.Timer(1000); // 每秒检查重传
             _resendTimer.Elapsed += CheckResends;
         }
 
@@ -84,10 +87,14 @@ namespace Client
                 try
                 {
                     Console.WriteLine($"Resending SeqNum={item.Key} (Attempt {item.Value.RetryCount + 1})");
-                    await SendData(item.Value.communicationData);
+                    await SendRawData(item.Value.communicationData);
                     item.Value.RetryCount++;
                     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                    var ack = await Task.Run(() => ReceiveData(cts.Token));
+                    var ack = await Task.Run(() => ReceiveRawData(cts.Token));
+                    if(ack!= null && ack.InfoType != InfoType.HeartBeat)
+                    {
+                        _pendingMessages.Remove(ack.AckNum);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -123,11 +130,11 @@ namespace Client
                 };
 
                 // 通过统一发送接口发送心跳包
-                await SendData(heartbeatData);
+                await SendRawData(heartbeatData);
 
                 // 使用独立定时器等待ACK（避免阻塞主线程）
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                var ack = await Task.Run(() => ReceiveData(cts.Token));
+                var ack = await Task.Run(() => ReceiveRawData(cts.Token));
                 
                 if(ack == null)
                 {
@@ -158,26 +165,23 @@ namespace Client
                     _pendingMessages.Add(data.SeqNum, date);
                 }
                 data.SeqNum = _currentSeq;
+                _currentSeq++;
             }
             await lockToTake.WaitAsync();
             try
             {
-                // 统一序列化发送逻辑
-                var json = JsonSerializer.Serialize(data);
-                byte[] payload = Encoding.UTF8.GetBytes(json);
-                byte[] lengthPrefix = BitConverter.GetBytes(payload.Length);
-
-                byte[] fullPacket = new byte[lengthPrefix.Length + payload.Length];
-                Buffer.BlockCopy(lengthPrefix, 0, fullPacket, 0, lengthPrefix.Length);
-                Buffer.BlockCopy(payload, 0, fullPacket, lengthPrefix.Length, payload.Length);
-
-                await _clientSocket.SendAsync(fullPacket, SocketFlags.None);
-                if(data.InfoType == InfoType.HeartBeat) 
+                await SendRawData(data);
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                var ack = await Task.Run(() => ReceiveRawData(cts.Token));
+                if(ack != null)
                 {
-                    Console.WriteLine($"Sent: {data.InfoType}");
+                    if (data.InfoType == InfoType.HeartBeat)
+                    {
+                        Console.WriteLine($"Sent: {data.InfoType}");
+                    }
+                    else
+                        Console.WriteLine($"Sent: {data.InfoType}, Seq={data.SeqNum}, Ack={ack.AckNum}");
                 }
-                else
-                    Console.WriteLine($"Sent: {data.InfoType}, Seq={data.SeqNum}, Ack={_expectedAck}");
 
                 _skipNextHeartbeat = true;
             }
@@ -186,9 +190,26 @@ namespace Client
                 lockToTake.Release();
             }
         }
+        private async Task SendRawData(CommunicationData data)
+        {
+            // 统一序列化发送逻辑
+            var json = JsonSerializer.Serialize(data);
+            byte[] payload = Encoding.UTF8.GetBytes(json);
+            byte[] lengthPrefix = BitConverter.GetBytes(payload.Length);
 
+            byte[] fullPacket = new byte[lengthPrefix.Length + payload.Length];
+            Buffer.BlockCopy(lengthPrefix, 0, fullPacket, 0, lengthPrefix.Length);
+            Buffer.BlockCopy(payload, 0, fullPacket, lengthPrefix.Length, payload.Length);
+
+            await _clientSocket.SendAsync(fullPacket, SocketFlags.None);
+        }
         // 修改 ReceiveData 方法
         public async Task<CommunicationData> ReceiveData(CancellationToken token)
+        {
+            var ack = await Task.Run(() => ReceiveRawData(token));
+            return ack;
+        }
+        private async Task<CommunicationData> ReceiveRawData(CancellationToken token)
         {
             try
             {
@@ -200,11 +221,6 @@ namespace Client
                 await _clientSocket.ReceiveAsync(new ArraySegment<byte>(dataBuffer), SocketFlags.None, token);
 
                 var data = JsonSerializer.Deserialize<CommunicationData>(Encoding.UTF8.GetString(dataBuffer));
-
-                if (data.InfoType != InfoType.HeartBeat)
-                {
-                    _currentSeq++;
-                }
 
                 return data;
             }
@@ -293,7 +309,7 @@ namespace Client
                             FileChunks = new List<FileChunk> { chunk }
                         };
 
-                        await SendData(message);
+                        await SendRawData(message);
                         transferInfo.SentChunks.Add(i);
                         progressCallback?.Invoke((int)((i + 1) * 100 / transferInfo.TotalChunks));
 
@@ -309,7 +325,7 @@ namespace Client
                         FileId = fileId,
                         Message = "FILE_COMPLETE"
                     };
-                    await SendData(completionMessage);
+                    await SendRawData(completionMessage);
                     await ReceiveFileAck(TimeSpan.FromSeconds(30));
                 }
                 finally
@@ -329,7 +345,7 @@ namespace Client
             {
                 try
                 {
-                    var ack = await ReceiveData(cts.Token);
+                    var ack = await ReceiveRawData(cts.Token);
                     if (ack == null)
                     {
                         await ResendMissingChunks();
@@ -388,7 +404,7 @@ namespace Client
                                 FileId = transfer.FileId,
                                 FileChunks = new List<FileChunk> { chunk }
                             };
-                            await SendData(message);
+                            await SendRawData(message);
                         }
                     }
                 }
