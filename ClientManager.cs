@@ -22,8 +22,8 @@ public class StressTester
         File.WriteAllBytes(TestFilePath, new byte[1024 * 1024]); // 1MB文件
 
         //await RunConnectionStressTest();
-        //await RunMessageStormTest();
-        await RunFileTransferTest();
+        await RunMessageStormTest();
+        //await RunFileTransferTest();
     }
 
     private static async Task RunConnectionStressTest()
@@ -46,11 +46,11 @@ public class StressTester
 
         Console.WriteLine($"成功建立 {ConcurrentClients} 个连接，耗时 {sw.ElapsedMilliseconds}ms");
 
-        // 断开所有连接
-        foreach (var client in clients)
-        {
-            client.Disconnect();
-        }
+        //// 断开所有连接
+        //foreach (var client in clients)
+        //{
+        //    client.Disconnect();
+        //}
     }
 
     private static async Task RunMessageStormTest()

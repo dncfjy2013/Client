@@ -264,40 +264,81 @@ namespace Client
                 Console.WriteLine($"Sent: {data.InfoType}, Seq={data.SeqNum}");
             });
         }
+        // 初始化配置（示例）
+        ProtocolConfiguration config = new ProtocolConfiguration
+        {
+            DataSerializer = new JsonSerializerAdapter(),
+            ChecksumCalculator = new Crc16Calculator(),
+            SupportedVersions = new byte[] { 0x01, 0x02 },
+            MaxPacketSize = 2 * 1024 * 1024 // 2MB
+        };
+        // 修改后的发送方法
         private async Task SendRawData(CommunicationData data)
         {
-            // 统一序列化发送逻辑
-            var json = JsonSerializer.Serialize(data);
-            byte[] payload = Encoding.UTF8.GetBytes(json);
-            byte[] lengthPrefix = BitConverter.GetBytes(payload.Length);
+            var packet = new ProtocolPacket(config)
+            {
+                Header = new ProtocolHeader { Version = ProtocolHeader.CurrentVersion },
+                Data = data
+            };
 
-            byte[] fullPacket = new byte[lengthPrefix.Length + payload.Length];
-            Buffer.BlockCopy(lengthPrefix, 0, fullPacket, 0, lengthPrefix.Length);
-            Buffer.BlockCopy(payload, 0, fullPacket, lengthPrefix.Length, payload.Length);
-
+            // 使用协议配置中的序列化器和校验和计算
+            byte[] fullPacket = packet.ToBytes();
             await _clientSocket.SendAsync(fullPacket, SocketFlags.None);
         }
-        
+
         // 修改 ReceiveData 方法
         public async Task<CommunicationData> ReceiveData(CancellationToken token)
         {
             var ack = await Task.Run(() => ReceiveRawData(token));
             return ack;
         }
+        // 优化后的接收方法
+        // 修改后的接收方法
         private async Task<CommunicationData> ReceiveRawData(CancellationToken token)
         {
             try
             {
-                byte[] header = new byte[4];
-                await _clientSocket.ReceiveAsync(new ArraySegment<byte>(header), SocketFlags.None, token);
-                int msgLength = BitConverter.ToInt32(header, 0);
+                // 第一阶段：读取协议头（8字节）
+                byte[] headerBuffer = new byte[8];
+                int headerOffset = 0;
+                while (headerOffset < headerBuffer.Length)
+                {
+                    int n = await _clientSocket.ReceiveAsync(
+                        new ArraySegment<byte>(headerBuffer, headerOffset, headerBuffer.Length - headerOffset),
+                        SocketFlags.None,
+                        token);
 
-                byte[] dataBuffer = new byte[msgLength];
-                await _clientSocket.ReceiveAsync(new ArraySegment<byte>(dataBuffer), SocketFlags.None, token);
+                    if (n == 0) return null; // 连接正常关闭
+                    headerOffset += n;
+                }
 
-                var data = JsonSerializer.Deserialize<CommunicationData>(Encoding.UTF8.GetString(dataBuffer));
+                // 解析协议头并进行版本检查
+                if (!ProtocolHeader.TryFromBytes(headerBuffer, out ProtocolHeader header) ||
+                    !config.SupportedVersions.Contains(header.Version))
+                {
+                    Console.WriteLine("Invalid protocol header or unsupported version");
+                    return null;
+                }
 
-                return data;
+                // 第二阶段：读取消息体（含校验和）
+                byte[] payloadBuffer = new byte[header.MessageLength];
+                int payloadOffset = 0;
+                while (payloadOffset < header.MessageLength)
+                {
+                    int n = await _clientSocket.ReceiveAsync(
+                        new ArraySegment<byte>(payloadBuffer, payloadOffset, header.MessageLength - payloadOffset),
+                        SocketFlags.None,
+                        token);
+
+                    if (n == 0) return null; // 连接正常关闭
+                    payloadOffset += n;
+                }
+
+                // 合并完整数据包并进行完整校验
+                byte[] fullPacket = headerBuffer.Concat(payloadBuffer).ToArray();
+                var parseResult = await ProtocolPacket.TryFromBytesAsync(fullPacket, config);
+
+                return parseResult.Success ? parseResult.Packet.Data : null;
             }
             catch (OperationCanceledException)
             {

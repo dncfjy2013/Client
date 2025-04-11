@@ -37,12 +37,27 @@ namespace Client.utils
             _logWriterTask = Task.Factory.StartNew(() => LogWriterLoop(), _cancellationTokenSource.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
-        public void Log(LogLevel level, string message)
+        private void Log(LogLevel level, string message)
         {
             Console.WriteLine($"[{DateTime.Now}] {level} " + message);
             _logQueue.Add((level, message));
         }
-
+        public void LogError(string message)
+        {
+            Log(LogLevel.Error, message);
+        }
+        public void LogError(ExecutionContext context, string message)
+        {
+            Log(LogLevel.Error, context + "-" +message);
+        }
+        public void LogWarning(string message)
+        {
+            Log(LogLevel.Warning, message);
+        }
+        public void LogInfo(string message)
+        {
+            Log(LogLevel.Info, message);
+        }
         public void LogTemp(LogLevel level, string message)
         {
             Console.WriteLine($"[{DateTime.Now}] {level} " + message);
