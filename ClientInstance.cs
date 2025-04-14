@@ -555,19 +555,19 @@ namespace Client
 
             _fileTransfers[fileId] = session;
 
-            // 计算文件整体MD5（可以后台进行）
-            _ = Task.Run(() => CalculateFileHashAsync(session));
+            // 并行计算哈希和传输
+            var hashTask = CalculateFileHashAsync(session);
+            var transferTask = StartFileTransfer(session);
 
-            // 启动传输
-            await StartFileTransfer(session);
+            await Task.WhenAll(hashTask, transferTask);
         }
 
         private int CalculateChunkSize(long fileSize)
         {
             // 动态计算块大小，大文件使用更大的块
-            if (fileSize > 10L * 1024 * 1024 * 1024) return 4 * 1024 * 1024;   // 10GB+文件用4MB块
-            if (fileSize > 1L * 1024 * 1024 * 1024) return 1 * 1024 * 1024;    // 1GB+文件用1MB块
-            return 256 * 1024;  // 小文件用256KB块
+            if (fileSize > 10L * 1024 * 1024 * 1024) return 8 * 1024 * 1024;   // 10GB+文件用4MB块
+            if (fileSize > 1L * 1024 * 1024 * 1024) return 4 * 1024 * 1024;    // 1GB+文件用1MB块
+            return 1024 * 1024;  // 小文件用256KB块
         }
 
         private async Task StartFileTransfer(FileTransferSession session)
@@ -582,23 +582,20 @@ namespace Client
                 var tasks = new List<Task>();
                 var chunkIndexes = Enumerable.Range(0, session.TotalChunks).ToList();
 
-                foreach (var chunkIndex in chunkIndexes)
+                // 使用并行循环限制并发度
+                var options = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount * 2 };
+                await Parallel.ForEachAsync(chunkIndexes, options, async (chunkIndex, ct) =>
                 {
-                    // 控制并发数
-                    await _fileTransferSemaphore.WaitAsync();
-
-                    tasks.Add(Task.Run(async () =>
+                    await _fileTransferSemaphore.WaitAsync(ct);
+                    try
                     {
-                        try
-                        {
-                            await SendFileChunk(fileStream, session, chunkIndex);
-                        }
-                        finally
-                        {
-                            _fileTransferSemaphore.Release();
-                        }
-                    }));
-                }
+                        await SendFileChunk(fileStream, session, chunkIndex);
+                    }
+                    finally
+                    {
+                        _fileTransferSemaphore.Release();
+                    }
+                });
 
                 await Task.WhenAll(tasks);
 
@@ -620,9 +617,7 @@ namespace Client
 
         private async Task SendFileChunk(FileStream fileStream, FileTransferSession session, int chunkIndex)
         {
-            var chunkSize = chunkIndex == session.TotalChunks - 1
-                ? (int)(session.FileSize - chunkIndex * session.ChunkSize)
-                : session.ChunkSize;
+            var chunkSize = (int)Math.Min(session.ChunkSize, session.FileSize - chunkIndex * session.ChunkSize);
 
             var buffer = new byte[chunkSize];
             fileStream.Seek(chunkIndex * session.ChunkSize, SeekOrigin.Begin);
@@ -646,7 +641,12 @@ namespace Client
             await SendData(data);
 
             Interlocked.Add(ref session.TransferredBytes, chunkSize);
-            UpdateProgress(session, TransferStatus.Transferring);
+
+            // 添加进度更新节流
+            if (chunkIndex % 10 == 0) // 每10个分块更新一次
+            {
+                UpdateProgress(session, TransferStatus.Transferring);
+            }
         }
 
         private async Task SendTransferComplete(FileTransferSession session)
@@ -712,6 +712,11 @@ namespace Client
             }
 
             Console.WriteLine("Connection closed gracefully");
+        }
+
+        public void Dispose()
+        {
+            Disconnect();
         }
     }
 }

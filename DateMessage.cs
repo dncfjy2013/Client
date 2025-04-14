@@ -55,7 +55,8 @@ public enum TransferStatus
     Transferring,
     Verifying,
     Completed,
-    Failed
+    Failed,
+    Canceled
 }
 public enum DataPriority
 {
