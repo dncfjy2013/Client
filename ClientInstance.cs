@@ -23,20 +23,15 @@ namespace Client
         private Socket _clientSocket;
         private bool _isConnected = false;
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
-        private int _currentSeq = 0; // 当前发送序列号
-        private readonly Dictionary<int, Date> _pendingMessages = new();
+        private readonly Dictionary<int, DependingMessage> _pendingMessages = new();
         private readonly Logger logger = Logger.GetInstance();
         private int _heartbeatCountout;
-        // 新增文件传输相关字段
-        private readonly ConcurrentDictionary<string, FileTransferState> _activeTransfers = new();
-        private readonly object _transferLock = new object();
+
         // 初始化信号量（在构造函数中）
-        private readonly SemaphoreSlim _transferSemaphore = new SemaphoreSlim(1, 1);
         private bool _skipNextHeartbeat = false;
 
         private const int WindowSize = 1000; // 窗口大小
         private readonly Queue<int> _sendWindow = new Queue<int>(); // 发送窗口队列
-        private int _nextExpectedSeq = 1; // 下一个期望接收的序列号
         private readonly Dictionary<int, CommunicationData> _receiveBuffer = new(); // 接收缓冲区
         private int _isHeartAck = 0;
         private CancellationTokenSource _receiveCts;
@@ -44,7 +39,30 @@ namespace Client
         private const int HeartbeatIntervalMs = 3000;
         private const int AckTimeoutMs = 1000; // 原逻辑10*10ms=100ms，建议延长
         private const int MaxMissedHeartbeats = 3; // 原100次约5分钟，建议缩短
-
+                                                   // 新增优先级序列号管理
+        private readonly Dictionary<DataPriority, int> _prioritySequences = new()
+        {
+            { DataPriority.High, 0 },
+            { DataPriority.Medium, 0 },
+            { DataPriority.Low, 0 }
+        };
+        private readonly Dictionary<DataPriority, int> _priorityNextExpect = new()
+        {
+            { DataPriority.High, 1 },
+            { DataPriority.Medium, 1 },
+            { DataPriority.Low, 1 }
+        };
+        private readonly object _sequenceLock = new();
+        // ACK接收事件
+        private event Action<int> AckReceived;
+        // 初始化配置（示例）
+        ProtocolConfiguration config = new ProtocolConfiguration
+        {
+            DataSerializer = new JsonSerializerAdapter(),
+            ChecksumCalculator = new Crc16Calculator(),
+            SupportedVersions = new byte[] { 0x01, 0x02 },
+            MaxPacketSize = 2 * 1024 * 1024 // 2MB
+        };
         public ClientInstance(string serverIp, int port)
         {
             _serverIp = serverIp;
@@ -70,7 +88,7 @@ namespace Client
             // 连接成功后启动心跳
             StartHeartbeat();
             StartReceiveProcessing();
-            StartCheckResends();
+            //StartCheckResends();
             _isConnected = true;
             _heartbeatCountout = 0;
         }
@@ -79,23 +97,23 @@ namespace Client
         {
             Task.Run(async () =>
             {
-                while (!_isConnected)
+                while (_isConnected)
                 {
-                    await Task.Delay(1000);
+                    await Task.Delay(1000); // 每秒检查一次
 
-                    const int MaxRetries = 5;
                     var now = DateTime.Now;
                     var toResend = _pendingMessages
-                        .Where(p => p.Value.RetryCount < MaxRetries &&
-                                   (now - p.Value.FirstSentTime).TotalMilliseconds >
-                                   Math.Pow(2, p.Value.RetryCount) * 1000 && p.Value.communicationData.SeqNum > _nextExpectedSeq)
+                        .Where(p =>
+                            p.Value.communicationData.Priority <= DataPriority.Medium && // 只重传高和中优先级
+                            p.Value.RetryCount < GetMaxRetries(p.Value.communicationData.Priority) &&
+                            (now - p.Value.FirstSentTime).TotalMilliseconds > GetRetryDelay(p.Value.RetryCount, p.Value.communicationData.Priority))
                         .ToList();
 
                     foreach (var item in toResend)
                     {
                         try
                         {
-                            Console.WriteLine($"Resending SeqNum={item.Key}");
+                            Console.WriteLine($"Resending {item.Value.communicationData.Priority} priority Seq={item.Key}");
                             await SendRawData(item.Value.communicationData);
                             item.Value.RetryCount++;
                         }
@@ -106,6 +124,28 @@ namespace Client
                     }
                 }
             });
+        }
+
+        private int GetMaxRetries(DataPriority priority)
+        {
+            return priority switch
+            {
+                DataPriority.High => 5,    // 高优先级最多重试5次
+                DataPriority.Medium => 3,  // 中优先级最多重试3次
+                _ => 0                    // 低优先级不重试
+            };
+        }
+
+        private double GetRetryDelay(int retryCount, DataPriority priority)
+        {
+            var baseDelay = priority switch
+            {
+                DataPriority.High => 500,  // 高优先级基础延迟500ms
+                DataPriority.Medium => 1000, // 中优先级1s
+                _ => 2000                // 低优先级2s（实际上不会用到）
+            };
+
+            return baseDelay * Math.Pow(2, retryCount); // 指数退避
         }
 
         private void StartReceiveProcessing()
@@ -142,37 +182,94 @@ namespace Client
             }, _receiveCts.Token);
         }
 
+        // 接收处理增强
         private void ProcessReceivedData(CommunicationData data)
         {
-            // 处理乱序包
-            if (data.SeqNum == _nextExpectedSeq)
+            // 触发ACK事件
+            if (data.AckNum > 0)
             {
-                // 按序到达：提交数据并移动接收窗口
-                Console.WriteLine($"Received Seq={data.SeqNum}");
-                _receiveBuffer.Remove(data.SeqNum);
-                _nextExpectedSeq++;
-                _pendingMessages.Remove(data.SeqNum);
-                // 触发窗口滑动
-                lock (_sendLock)
-                {
-                    while (_sendWindow.Count > 0 &&
-                           _sendWindow.Peek() < _nextExpectedSeq)
-                    {
-                        _sendWindow.Dequeue();
-                        Monitor.Pulse(_sendLock); // 通知发送线程窗口可用
-                    }
-                }
-            }
-            if (data.SeqNum > _nextExpectedSeq)
-            {
-                // 乱序包暂存
-                _receiveBuffer[data.SeqNum] = data;
-                Console.WriteLine($"Buffered Seq={data.SeqNum}");
+                AckReceived?.Invoke(data.AckNum);
             }
 
-            if(data.SeqNum < _nextExpectedSeq)
+            // 根据优先级处理数据
+            switch (data.Priority)
             {
-                _pendingMessages.Remove(data.SeqNum);
+                case DataPriority.High:
+                    ProcessHighPriorityData(data);
+                    break;
+
+                case DataPriority.Medium:
+                    ProcessMediumPriorityData(data);
+                    break;
+
+                case DataPriority.Low:
+                    ProcessLowPriorityData(data);
+                    break;
+            }
+        }
+
+        private void ProcessHighPriorityData(CommunicationData data)
+        {
+            // 严格顺序处理
+            if (data.SeqNum == _priorityNextExpect[data.Priority]++)
+            {
+                Console.WriteLine($"Processing HIGH priority Seq={data.SeqNum}");
+                DeliverData(data);
+
+                // 处理缓冲的后续包
+                while (_receiveBuffer.TryGetValue(_priorityNextExpect[data.Priority], out var bufferedData))
+                {
+                    Console.WriteLine($"Processing buffered HIGH priority Seq={_priorityNextExpect[data.Priority]}");
+                    _receiveBuffer.Remove(_priorityNextExpect[data.Priority]);
+                    _priorityNextExpect[data.Priority]++;
+                    DeliverData(bufferedData);
+                }
+            }
+            else if (data.SeqNum > _priorityNextExpect[data.Priority])
+            {
+                // 缓存乱序包
+                _receiveBuffer[data.SeqNum] = data;
+                Console.WriteLine($"Buffered HIGH priority Seq={data.SeqNum}");
+            }
+            // SeqNum < _nextExpectedSeq 的包视为重复包，忽略
+        }
+
+        private void ProcessMediumPriorityData(CommunicationData data)
+        {
+            // 中等优先级：允许有限乱序
+            if (data.SeqNum >= _priorityNextExpect[data.Priority] - 10 &&
+                data.SeqNum <= _priorityNextExpect[data.Priority] + 10)
+            {
+                Console.WriteLine($"Processing MEDIUM priority Seq={data.SeqNum}");
+                DeliverData(data);
+                _priorityNextExpect[data.Priority] = Math.Max(_priorityNextExpect[data.Priority], data.SeqNum + 1);
+            }
+        }
+
+        private void ProcessLowPriorityData(CommunicationData data)
+        {
+            // 低优先级：直接处理，不保证顺序
+            Console.WriteLine($"Processing LOW priority Seq={data.SeqNum}");
+            DeliverData(data);
+        }
+
+        private void DeliverData(CommunicationData data)
+        {
+            // 实际数据处理逻辑
+            Console.WriteLine($"Delivering: {data.Message}");
+
+            // 发送ACK（对高和中优先级数据）
+            if (data.Priority <= DataPriority.Medium)
+            {
+                _ = Task.Run(async () =>
+                {
+                    var ack = new CommunicationData
+                    {
+                        AckNum = data.SeqNum,
+                        Priority = DataPriority.High // ACK使用高优先级
+                    };
+                    await SendRawData(ack);
+                });
             }
         }
 
@@ -234,44 +331,93 @@ namespace Client
 
         public async Task SendData(CommunicationData data)
         {
-            // 窗口控制逻辑
-            lock (_sendLock)
+            // 根据优先级分配序列号
+            lock (_sequenceLock)
             {
-                while (_sendWindow.Count >= WindowSize)
-                {
-                    // 添加超时机制
-                    if (!Monitor.Wait(_sendLock, TimeSpan.FromSeconds(10)))
-                    {
-                        throw new TimeoutException("Send window blocked");
-                    }
-                }
+                data.SeqNum = ++_prioritySequences[data.Priority];
+            }
 
-                data.SeqNum = Interlocked.Increment(ref _currentSeq);
-                _pendingMessages[data.SeqNum] = new Date
+            // 窗口控制逻辑（仅对高优先级数据严格限制）
+            if (data.Priority == DataPriority.High)
+            {
+                await WaitForWindowAvailability(data.SeqNum);
+            }
+
+            // 记录待确认消息（仅高和中优先级）
+            if (data.Priority <= DataPriority.Medium)
+            {
+                _pendingMessages[data.SeqNum] = new DependingMessage
                 {
                     communicationData = data,
                     FirstSentTime = DateTime.Now,
                     RetryCount = 0
                 };
-
-                _sendWindow.Enqueue(data.SeqNum);
             }
 
-            // 异步发送（无需等待ACK即可继续发送窗口内数据）
+            // 异步发送
             _ = Task.Run(async () =>
             {
-                await SendRawData(data);
-                Console.WriteLine($"Sent: {data.InfoType}, Seq={data.SeqNum}");
+                try
+                {
+                    await SendRawData(data);
+                    Console.WriteLine($"Sent: {data.InfoType}, Seq={data.SeqNum}, Pri={data.Priority}");
+
+                    // 高优先级数据需要等待ACK或重试
+                    if (data.Priority == DataPriority.High)
+                    {
+                        await WaitForAck(data.SeqNum);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    HandleSendFailure(ex, data);
+                }
             });
         }
-        // 初始化配置（示例）
-        ProtocolConfiguration config = new ProtocolConfiguration
+
+        private async Task WaitForWindowAvailability(int seqNum)
         {
-            DataSerializer = new JsonSerializerAdapter(),
-            ChecksumCalculator = new Crc16Calculator(),
-            SupportedVersions = new byte[] { 0x01, 0x02 },
-            MaxPacketSize = 2 * 1024 * 1024 // 2MB
-        };
+            lock (_sendLock)
+            {
+                while (_sendWindow.Count >= WindowSize)
+                {
+                    if (!Monitor.Wait(_sendLock, TimeSpan.FromSeconds(10)))
+                    {
+                        throw new TimeoutException("Send window blocked for too long");
+                    }
+                }
+                _sendWindow.Enqueue(seqNum);
+            }
+        }
+
+        private async Task WaitForAck(int seqNum)
+        {
+            var timeout = Task.Delay(5000); // 5秒ACK超时
+            var completionSource = new TaskCompletionSource<bool>();
+
+            // 设置ACK到达回调
+            Action<int> ackHandler = null;
+            ackHandler = (ackedSeq) =>
+            {
+                if (ackedSeq == seqNum)
+                {
+                    _pendingMessages.Remove(seqNum);
+                    completionSource.TrySetResult(true);
+                    AckReceived -= ackHandler; // 移除事件处理
+                }
+            };
+
+            AckReceived += ackHandler;
+
+            // 等待ACK或超时
+            var completedTask = await Task.WhenAny(completionSource.Task, timeout);
+            if (completedTask == timeout)
+            {
+                AckReceived -= ackHandler;
+                throw new TimeoutException($"ACK for seq {seqNum} not received");
+            }
+        }
+
         // 修改后的发送方法
         private async Task SendRawData(CommunicationData data)
         {
@@ -374,160 +520,6 @@ namespace Client
             catch (Exception reconnectEx)
             {
                 Console.WriteLine($"Reconnect failed: {reconnectEx.Message}");
-            }
-        }
-
-        public async Task SendFile(string filePath, string fileId, Action<int> progressCallback = null)
-        {
-            var fileInfo = new FileInfo(filePath);
-            using (var md5 = MD5.Create())
-            using (var stream = File.OpenRead(filePath))
-            {
-                byte[] checksum = md5.ComputeHash(stream);
-                stream.Position = 0;
-
-                var transferInfo = new FileTransferState
-                {
-                    TotalChunks = (int)Math.Ceiling(fileInfo.Length / (double)Constants.ChunkSize),
-                    FileName = Path.GetFileName(filePath),
-                    MD5Hash = BitConverter.ToString(checksum).Replace("-", ""),
-                    FileId = fileId,
-                    SentChunks = new HashSet<int>(),
-                    ProgressCallback = progressCallback
-                };
-
-                lock (_transferLock)
-                {
-                    _activeTransfers[fileId] = transferInfo;
-                }
-
-                try
-                {
-                    for (int i = 0; i < transferInfo.TotalChunks; i++)
-                    {
-                        if (_activeTransfers.TryGetValue(fileId, out var state) && state.Cancelled)
-                        {
-                            break;
-                        }
-
-                        byte[] chunkData = new byte[Constants.ChunkSize];
-                        int bytesRead = await stream.ReadAsync(chunkData, 0, Constants.ChunkSize);
-                        Array.Resize(ref chunkData, bytesRead);
-
-                        var chunk = new FileChunk { Index = i, Data = chunkData };
-                        var message = new CommunicationData
-                        {
-                            InfoType = InfoType.File,
-                            FileId = fileId,
-                            FileName = transferInfo.FileName,
-                            TotalChunks = transferInfo.TotalChunks,
-                            MD5Hash = transferInfo.MD5Hash,
-                            FileChunks = new List<FileChunk> { chunk }
-                        };
-
-                        await SendRawData(message);
-                        transferInfo.SentChunks.Add(i);
-                        progressCallback?.Invoke((int)((i + 1) * 100 / transferInfo.TotalChunks));
-
-                        // 等待ACK
-                        var ack = await ReceiveFileAck(TimeSpan.FromSeconds(30));
-                        HandleFileAck(ack, transferInfo);
-                    }
-
-                    // 发送完成标记
-                    var completionMessage = new CommunicationData
-                    {
-                        InfoType = InfoType.File,
-                        FileId = fileId,
-                        Message = "FILE_COMPLETE"
-                    };
-                    await SendRawData(completionMessage);
-                    await ReceiveFileAck(TimeSpan.FromSeconds(30));
-                }
-                finally
-                {
-                    lock (_transferLock)
-                    {
-                        _activeTransfers.TryRemove(fileId, out _);
-                    }
-                }
-            }
-        }
-
-        private async Task<CommunicationData> ReceiveFileAck(TimeSpan timeout)
-        {
-            using var cts = new CancellationTokenSource(timeout);
-            while (true)
-            {
-                try
-                {
-                    var ack = await ReceiveRawData(cts.Token);
-                    if (ack == null)
-                    {
-                        await ResendMissingChunks();
-                    }
-                    if (ack.Message == "FILE_ACK" || ack.Message == "FILE_COMPLETE_ACK") return ack;
-                }
-                catch (TimeoutException)
-                {
-                    // 实现重传逻辑
-                    await ResendMissingChunks();
-                }
-            }
-        }
-
-        private void HandleFileAck(CommunicationData ack, FileTransferState transferInfo)
-        {
-            if (ack.ReceivedChunks != null)
-            {
-                lock (_transferLock)
-                {
-                    foreach (var chunk in ack.ReceivedChunks)
-                    {
-                        transferInfo.SentChunks.Add(chunk);
-                    }
-                }
-            }
-        }
-
-        private async Task ResendMissingChunks()
-        {
-            await _transferSemaphore.WaitAsync();
-            try
-            {
-                foreach (var transfer in _activeTransfers.Values.ToList())
-                {
-                    var missingChunks = Enumerable.Range(0, transfer.TotalChunks)
-                        .Where(i => !transfer.SentChunks.Contains(i))
-                        .ToList();
-
-                    using (var fs = File.OpenRead(transfer.FilePath))
-                    {
-                        foreach (var chunkIndex in missingChunks)
-                        {
-                            fs.Position = chunkIndex * Constants.ChunkSize;
-                            byte[] buffer = new byte[Constants.ChunkSize];
-                            int bytesRead = await fs.ReadAsync(buffer, 0, Constants.ChunkSize);
-                            var chunk = new FileChunk
-                            {
-                                Index = chunkIndex,
-                                Data = buffer.Take(bytesRead).ToArray()
-                            };
-
-                            var message = new CommunicationData
-                            {
-                                InfoType = InfoType.File,
-                                FileId = transfer.FileId,
-                                FileChunks = new List<FileChunk> { chunk }
-                            };
-                            await SendRawData(message);
-                        }
-                    }
-                }
-            }
-            finally
-            {
-                _transferSemaphore.Release();
             }
         }
 

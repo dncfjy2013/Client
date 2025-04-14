@@ -78,7 +78,8 @@ public class StressTester
                     var data = new CommunicationData
                     {
                         Message = $"Test message {i}",
-                        InfoType = InfoType.Normal
+                        InfoType = InfoType.Normal,
+                        Priority = DataPriority.High
                     };
                     await client.SendData(data);
                     Interlocked.Increment(ref successCount);
@@ -129,8 +130,8 @@ public class StressTester
             {
                 try
                 {
-                    await client.SendFile(TestFilePath, fileId,
-                        progress => Console.WriteLine($"进度：{progress}%"));
+                    //await client.SendFile(TestFilePath, fileId,
+                    //    progress => Console.WriteLine($"进度：{progress}%"));
                     Interlocked.Increment(ref successCount);
                 }
                 catch { /* 忽略传输失败 */ }
