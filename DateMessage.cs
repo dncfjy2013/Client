@@ -17,6 +17,45 @@ public class CommunicationData
     public int SeqNum { get; set; }     // 序列号
     public int AckNum { get; set; }     // 确认号
     public DataPriority Priority { get; set; } = DataPriority.Medium;
+
+    // 文件传输专用字段
+    public string FileId { get; set; }          // 文件唯一标识
+    public string FileName { get; set; }        // 文件名
+    public long FileSize { get; set; }          // 文件总大小
+    public int ChunkIndex { get; set; }         // 当前块索引
+    public int TotalChunks { get; set; }        // 总块数
+    public byte[] ChunkData { get; set; }       // 块数据
+    public string MD5Hash { get; set; }         // 文件整体MD5
+    public string ChunkMD5 { get; set; }        // 当前块MD5
+}
+public class FileTransferProgress
+{
+    public string FileId { get; set; }
+    public string FileName { get; set; }
+    public long TotalBytes { get; set; }
+    public long TransferredBytes { get; set; }
+    public double Progress => TotalBytes > 0 ? (double)TransferredBytes / TotalBytes : 0;
+    public TransferStatus Status { get; set; }
+}
+public class FileTransferSession
+{
+    public string FileId { get; set; }
+    public string FileName { get; set; }
+    public string FilePath { get; set; }
+    public long FileSize { get; set; }
+    public int TotalChunks { get; set; }
+    public int ChunkSize { get; set; }
+    public DataPriority Priority { get; set; }
+    public long TransferredBytes;
+    public string FileHash { get; set; }
+}
+public enum TransferStatus
+{
+    Preparing,
+    Transferring,
+    Verifying,
+    Completed,
+    Failed
 }
 public enum DataPriority
 {

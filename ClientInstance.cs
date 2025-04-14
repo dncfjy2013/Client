@@ -63,6 +63,10 @@ namespace Client
             SupportedVersions = new byte[] { 0x01, 0x02 },
             MaxPacketSize = 2 * 1024 * 1024 // 2MB
         };
+
+        // 新增文件传输相关字段
+        private readonly ConcurrentDictionary<string, FileTransferSession> _fileTransfers = new();
+        private readonly SemaphoreSlim _fileTransferSemaphore = new(Environment.ProcessorCount * 2);
         public ClientInstance(string serverIp, int port)
         {
             _serverIp = serverIp;
@@ -88,7 +92,7 @@ namespace Client
             // 连接成功后启动心跳
             StartHeartbeat();
             StartReceiveProcessing();
-            //StartCheckResends();
+            StartCheckResends();
             _isConnected = true;
             _heartbeatCountout = 0;
         }
@@ -294,6 +298,7 @@ namespace Client
                         {
                             Message = "Heartbeat",
                             InfoType = InfoType.HeartBeat,
+                            Priority = DataPriority.High
                         };
 
                         await SendData(heartbeatData);
@@ -521,6 +526,169 @@ namespace Client
             {
                 Console.WriteLine($"Reconnect failed: {reconnectEx.Message}");
             }
+        }
+
+        // 进度回调事件
+        public event Action<FileTransferProgress> OnFileTransferProgress;
+
+        public async Task UploadFileAsync(string filePath, DataPriority priority = DataPriority.Medium)
+        {
+            var fileInfo = new FileInfo(filePath);
+            if (!fileInfo.Exists)
+                throw new FileNotFoundException("File not found", filePath);
+
+            var fileId = Guid.NewGuid().ToString();
+            var chunkSize = CalculateChunkSize(fileInfo.Length);
+            var totalChunks = (int)((fileInfo.Length + chunkSize - 1) / chunkSize);
+
+            // 初始化传输会话
+            var session = new FileTransferSession
+            {
+                FileId = fileId,
+                FileName = fileInfo.Name,
+                FilePath = filePath,
+                FileSize = fileInfo.Length,
+                TotalChunks = totalChunks,
+                ChunkSize = chunkSize,
+                Priority = priority
+            };
+
+            _fileTransfers[fileId] = session;
+
+            // 计算文件整体MD5（可以后台进行）
+            _ = Task.Run(() => CalculateFileHashAsync(session));
+
+            // 启动传输
+            await StartFileTransfer(session);
+        }
+
+        private int CalculateChunkSize(long fileSize)
+        {
+            // 动态计算块大小，大文件使用更大的块
+            if (fileSize > 10L * 1024 * 1024 * 1024) return 4 * 1024 * 1024;   // 10GB+文件用4MB块
+            if (fileSize > 1L * 1024 * 1024 * 1024) return 1 * 1024 * 1024;    // 1GB+文件用1MB块
+            return 256 * 1024;  // 小文件用256KB块
+        }
+
+        private async Task StartFileTransfer(FileTransferSession session)
+        {
+            UpdateProgress(session, TransferStatus.Preparing);
+
+            try
+            {
+                using var fileStream = new FileStream(session.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+
+                // 多线程分块读取和发送
+                var tasks = new List<Task>();
+                var chunkIndexes = Enumerable.Range(0, session.TotalChunks).ToList();
+
+                foreach (var chunkIndex in chunkIndexes)
+                {
+                    // 控制并发数
+                    await _fileTransferSemaphore.WaitAsync();
+
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await SendFileChunk(fileStream, session, chunkIndex);
+                        }
+                        finally
+                        {
+                            _fileTransferSemaphore.Release();
+                        }
+                    }));
+                }
+
+                await Task.WhenAll(tasks);
+
+                // 发送完成标记
+                await SendTransferComplete(session);
+
+                UpdateProgress(session, TransferStatus.Completed);
+            }
+            catch (Exception ex)
+            {
+                UpdateProgress(session, TransferStatus.Failed, ex.Message);
+                throw;
+            }
+            finally
+            {
+                _fileTransfers.TryRemove(session.FileId, out _);
+            }
+        }
+
+        private async Task SendFileChunk(FileStream fileStream, FileTransferSession session, int chunkIndex)
+        {
+            var chunkSize = chunkIndex == session.TotalChunks - 1
+                ? (int)(session.FileSize - chunkIndex * session.ChunkSize)
+                : session.ChunkSize;
+
+            var buffer = new byte[chunkSize];
+            fileStream.Seek(chunkIndex * session.ChunkSize, SeekOrigin.Begin);
+            await fileStream.ReadAsync(buffer, 0, chunkSize);
+
+            var chunkMd5 = CalculateChunkHash(buffer);
+
+            var data = new CommunicationData
+            {
+                InfoType = InfoType.File,
+                FileId = session.FileId,
+                FileName = session.FileName,
+                FileSize = session.FileSize,
+                ChunkIndex = chunkIndex,
+                TotalChunks = session.TotalChunks,
+                ChunkData = buffer,
+                ChunkMD5 = chunkMd5,
+                Priority = session.Priority
+            };
+
+            await SendData(data);
+
+            Interlocked.Add(ref session.TransferredBytes, chunkSize);
+            UpdateProgress(session, TransferStatus.Transferring);
+        }
+
+        private async Task SendTransferComplete(FileTransferSession session)
+        {
+            var completeData = new CommunicationData
+            {
+                InfoType = InfoType.File,
+                FileId = session.FileId,
+                Message = "FILE_COMPLETE",
+                MD5Hash = session.FileHash,
+                Priority = DataPriority.High // 完成通知用高优先级
+            };
+
+            await SendData(completeData);
+        }
+
+        private void UpdateProgress(FileTransferSession session, TransferStatus status, string error = null)
+        {
+            OnFileTransferProgress?.Invoke(new FileTransferProgress
+            {
+                FileId = session.FileId,
+                FileName = session.FileName,
+                TotalBytes = session.FileSize,
+                TransferredBytes = session.TransferredBytes,
+                Status = status
+            });
+        }
+
+        private async Task CalculateFileHashAsync(FileTransferSession session)
+        {
+            using var md5 = MD5.Create();
+            using var stream = File.OpenRead(session.FilePath);
+
+            session.FileHash = BitConverter.ToString(await md5.ComputeHashAsync(stream))
+                .Replace("-", "").ToLowerInvariant();
+        }
+
+        private string CalculateChunkHash(byte[] data)
+        {
+            using var md5 = MD5.Create();
+            return BitConverter.ToString(md5.ComputeHash(data))
+                .Replace("-", "").ToLowerInvariant();
         }
 
         public void Disconnect()
