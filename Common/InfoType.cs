@@ -11,5 +11,6 @@ namespace Client.Common
         HeartBeat = 0,
         Normal = 1,
         File = 2,
+        Ack = 3,
     }
 }

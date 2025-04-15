@@ -60,6 +60,16 @@ namespace Client
             { DataPriority.Low, 1 }
         };
         private readonly object _sequenceLock = new();
+        // 新增字段记录已处理的中等优先级序列号
+        private readonly SortedSet<int> _processedMediumSeq = new();
+        private readonly SortedDictionary<int, CommunicationData> _mediumBuffer = new();
+        private readonly HashSet<int> _processedMediumSeqs = new();
+        private int _mediumWindowSize = 20; // 初始窗口大小
+        private DateTime _lastWindowAdjustTime = DateTime.Now;
+
+        private readonly object _processedHighLock = new();
+        private readonly object _processedMediumLock = new();
+        private readonly object _processedLowLock = new();
         // ACK接收事件
         private event Action<int> AckReceived;
         // 初始化配置（示例）
@@ -221,47 +231,172 @@ namespace Client
 
         private void ProcessHighPriorityData(CommunicationData data)
         {
-            // 严格顺序处理
-            if (data.SeqNum == _priorityNextExpect[data.Priority]++)
+            lock (_processedHighLock)
             {
-                Console.WriteLine($"Processing HIGH priority Seq={data.SeqNum}");
-                DeliverData(data);
-
-                // 处理缓冲的后续包
-                while (_receiveBuffer.TryGetValue(_priorityNextExpect[data.Priority], out var bufferedData))
+                // 严格顺序处理
+                if (data.SeqNum == _priorityNextExpect[data.Priority]++)
                 {
-                    Console.WriteLine($"Processing buffered HIGH priority Seq={_priorityNextExpect[data.Priority]}");
-                    _receiveBuffer.Remove(_priorityNextExpect[data.Priority]);
-                    _priorityNextExpect[data.Priority]++;
-                    DeliverData(bufferedData);
+                    Console.WriteLine($"Processing HIGH priority Seq={data.SeqNum}");
+                    DeliverData(data);
+                    _pendingMessages.Remove(data.SeqNum);
+                    // 处理缓冲的后续包
+                    while (_receiveBuffer.TryGetValue(_priorityNextExpect[data.Priority], out var bufferedData))
+                    {
+                        if (bufferedData.SeqNum == _priorityNextExpect[data.Priority] + 1)
+                        {
+                            Console.WriteLine($"Processing buffered HIGH priority Seq={_priorityNextExpect[data.Priority]}");
+                            _receiveBuffer.Remove(_priorityNextExpect[data.Priority]);
+                            _priorityNextExpect[data.Priority]++;
+                            DeliverData(bufferedData);
+                        }
+                    }
                 }
+                else if (data.SeqNum > _priorityNextExpect[data.Priority])
+                {
+                    // 缓存乱序包
+                    _receiveBuffer[data.SeqNum] = data;
+                    Console.WriteLine($"Buffered HIGH priority Seq={data.SeqNum}");
+                }
+                // SeqNum < _nextExpectedSeq 的包视为重复包，忽略
             }
-            else if (data.SeqNum > _priorityNextExpect[data.Priority])
-            {
-                // 缓存乱序包
-                _receiveBuffer[data.SeqNum] = data;
-                Console.WriteLine($"Buffered HIGH priority Seq={data.SeqNum}");
-            }
-            // SeqNum < _nextExpectedSeq 的包视为重复包，忽略
         }
 
         private void ProcessMediumPriorityData(CommunicationData data)
         {
-            // 中等优先级：允许有限乱序
-            if (data.SeqNum >= _priorityNextExpect[data.Priority] - 10 &&
-                data.SeqNum <= _priorityNextExpect[data.Priority] + 10)
+            lock (_processedMediumLock)
             {
-                Console.WriteLine($"Processing MEDIUM priority Seq={data.SeqNum}");
-                DeliverData(data);
-                _priorityNextExpect[data.Priority] = Math.Max(_priorityNextExpect[data.Priority], data.SeqNum + 1);
+                // 1. 重复数据包检查
+                if (_processedMediumSeqs.Contains(data.SeqNum))
+                {
+                    Console.WriteLine($"Duplicate MEDIUM seq={data.SeqNum}");
+                    return;
+                }
+
+                // 2. 立即发送ACK（无论是否处理）
+                SendMediumAck(data.SeqNum);
+
+                // 3. 动态窗口范围计算
+                int expected = _priorityNextExpect[DataPriority.Medium];
+                int windowStart = expected;
+                int windowEnd = expected + _mediumWindowSize;
+
+                // 4. 判断是否在动态窗口内
+                if (data.SeqNum >= windowStart && data.SeqNum <= windowEnd)
+                {
+                    ProcessInWindow(data, ref expected);
+                }
+                else
+                {
+                    // 5. 超出窗口则缓冲管理
+                    if (!_mediumBuffer.ContainsKey(data.SeqNum))
+                    {
+                        _mediumBuffer.Add(data.SeqNum, data);
+                        Console.WriteLine($"Buffered MEDIUM seq={data.SeqNum} (window:{windowStart}-{windowEnd})");
+                    }
+                }
+
+                // 6. 动态调整窗口大小
+                AdjustWindowSize();
+            }
+        
+        }
+        private void ProcessInWindow(CommunicationData data, ref int expected)
+        {
+            // 标记为已处理
+            _processedMediumSeqs.Add(data.SeqNum);
+
+            // 处理当前数据包
+            DeliverData(data);
+            Console.WriteLine($"Processed MEDIUM seq={data.SeqNum}");
+
+            // 更新期望值：找到最大的连续序列号
+            while (_processedMediumSeqs.Contains(expected))
+            {
+                expected++;
+            }
+            _priorityNextExpect[DataPriority.Medium] = expected;
+
+            // 处理缓冲区内可处理的数据包
+            ProcessBufferedData(ref expected);
+        }
+
+        private void ProcessBufferedData(ref int expected)
+        {
+            // 从缓冲区提取连续序列号
+            while (_mediumBuffer.TryGetValue(expected, out var bufferedData))
+            {
+                DeliverData(bufferedData);
+                _mediumBuffer.Remove(expected);
+                _processedMediumSeqs.Add(expected);
+                expected++;
+                Console.WriteLine($"Process buffered MEDIUM seq={expected - 1}");
+            }
+            _priorityNextExpect[DataPriority.Medium] = expected;
+        }
+
+        private void AdjustWindowSize()
+        {
+            // 每5秒调整窗口大小
+            if ((DateTime.Now - _lastWindowAdjustTime).TotalSeconds < 5) return;
+
+            // 根据缓冲区积压情况动态调整
+            int bufferSize = _mediumBuffer.Count;
+            if (bufferSize > 50)
+            {
+                _mediumWindowSize = Math.Min(100, _mediumWindowSize + 10); // 扩大窗口
+            }
+            else if (bufferSize < 10 && _mediumWindowSize > 20)
+            {
+                _mediumWindowSize = Math.Max(20, _mediumWindowSize - 5); // 收缩窗口
+            }
+
+            // 根据处理延迟调整
+            var processingRate = CalculateProcessingRate();
+            _mediumWindowSize = processingRate switch
+            {
+                > 100 => _mediumWindowSize + 5,  // 高吞吐量时扩大窗口
+                < 50 => Math.Max(10, _mediumWindowSize - 3), // 低吞吐量时收缩
+                _ => _mediumWindowSize
+            };
+
+            Console.WriteLine($"Adjusted window size to {_mediumWindowSize}");
+            _lastWindowAdjustTime = DateTime.Now;
+        }
+
+        private double CalculateProcessingRate()
+        {
+            // 计算最近10秒的处理速率（包/秒）
+            var processedCount = _processedMediumSeqs.Count(s => s > _priorityNextExpect[DataPriority.Medium] - 100);
+            return processedCount / 10.0;
+        }
+
+        private async void SendMediumAck(int seqNum)
+        {
+            try
+            {
+                var ack = new CommunicationData
+                {
+                    AckNum = seqNum,
+                    Priority = DataPriority.High,
+                };
+                await SendRawData(ack);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"MEDIUM ACK发送失败 seq={seqNum}: {ex.Message}");
+                // 失败重试机制
+                _ = Task.Delay(100).ContinueWith(_ => SendMediumAck(seqNum));
             }
         }
 
         private void ProcessLowPriorityData(CommunicationData data)
         {
-            // 低优先级：直接处理，不保证顺序
-            Console.WriteLine($"Processing LOW priority Seq={data.SeqNum}");
-            DeliverData(data);
+            lock (_processedLowLock)
+            {
+                // 低优先级：直接处理，不保证顺序
+                Console.WriteLine($"Processing LOW priority Seq={data.SeqNum}");
+                DeliverData(data);
+            }
         }
 
         private void DeliverData(CommunicationData data)
@@ -276,6 +411,7 @@ namespace Client
                 {
                     var ack = new CommunicationData
                     {
+                        InfoType = InfoType.Ack,
                         AckNum = data.SeqNum,
                         Priority = DataPriority.High // ACK使用高优先级
                     };
