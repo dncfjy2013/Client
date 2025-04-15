@@ -29,7 +29,14 @@ namespace Client
 
         // 初始化信号量（在构造函数中）
         private bool _skipNextHeartbeat = false;
-
+        private int highUsed = 0;
+        private int mediumUsed = 0;
+        private int lowUsed = 0;
+        private const float HighBaseRatio = 0.8f;    // 高优先级基准比例
+        private const float LowMinRatio = 0.05f;    // 低优先级最低保留比例
+        private const float LowMaxRatio = 0.10f;    // 低优先级最高比例
+        private const int BufferReserve = 10;       // 动态调整缓冲区
+        private readonly object _windowLock = new object();
         private const int WindowSize = 1000; // 窗口大小
         private readonly Queue<int> _sendWindow = new Queue<int>(); // 发送窗口队列
         private readonly Dictionary<int, CommunicationData> _receiveBuffer = new(); // 接收缓冲区
@@ -343,10 +350,7 @@ namespace Client
             }
 
             // 窗口控制逻辑（仅对高优先级数据严格限制）
-            if (data.Priority == DataPriority.High)
-            {
-                await WaitForWindowAvailability(data.SeqNum);
-            }
+            await WaitForWindowAvailability(data.Priority);
 
             // 记录待确认消息（仅高和中优先级）
             if (data.Priority <= DataPriority.Medium)
@@ -380,21 +384,93 @@ namespace Client
             });
         }
 
-        private async Task WaitForWindowAvailability(int seqNum)
+        private async Task WaitForWindowAvailability(DataPriority priority)
         {
-            lock (_sendLock)
+            lock (_windowLock)
             {
-                while (_sendWindow.Count >= WindowSize)
+                while (true)
                 {
-                    if (!Monitor.Wait(_sendLock, TimeSpan.FromSeconds(10)))
+                    // 计算当前窗口状态
+                    int totalUsed = highUsed + mediumUsed + lowUsed;
+                    int windowRemain = WindowSize - totalUsed;
+
+                    // 动态计算低优先级配额
+                    int lowMax = Math.Min(
+                        (int)(WindowSize * LowMaxRatio),
+                        Math.Max(
+                            (int)(WindowSize * LowMinRatio),
+                            lowUsed + windowRemain
+                        )
+                    );
+
+                    // 高优先级动态调整因子
+                    float highUsageFactor = highUsed / (float)(WindowSize * HighBaseRatio);
+
+                    // 中优先级动态配额
+                    int mediumMax = (int)(WindowSize * (0.15f + 0.65f * (1 - highUsageFactor)));
+                    mediumMax = Math.Clamp(mediumMax, 0, WindowSize - (int)(WindowSize * LowMinRatio));
+
+                    switch (priority)
                     {
-                        throw new TimeoutException("Send window blocked for too long");
+                        case DataPriority.High:
+                            // 高优先级动态上限
+                            int highDynamicMax = (int)(WindowSize * HighBaseRatio +
+                                (WindowSize * 0.2f * (1 - highUsageFactor)));
+
+                            if (highUsed < highDynamicMax && windowRemain > 0)
+                            {
+                                highUsed++;
+                                return;
+                            }
+                            break;
+
+                        case DataPriority.Medium:
+                            // 中优先级可用空间 = 总剩余 - 低预留 - 缓冲区
+                            int mediumAvailable = WindowSize - highUsed - lowMax - BufferReserve;
+
+                            if (mediumUsed < mediumAvailable && windowRemain > 0)
+                            {
+                                mediumUsed++;
+                                return;
+                            }
+                            break;
+
+                        case DataPriority.Low:
+                            // 低优先级强制保留区间
+                            int lowAvailable = Math.Min(lowMax - lowUsed, windowRemain);
+
+                            if (lowAvailable > 0)
+                            {
+                                lowUsed++;
+                                return;
+                            }
+                            break;
                     }
+
+                    // 等待窗口空间释放
+                    Monitor.Wait(_windowLock, 100); // 添加超时防止死锁
                 }
-                _sendWindow.Enqueue(seqNum);
             }
         }
-
+        private void ReleaseWindowSlot(DataPriority priority)
+        {
+            lock (_windowLock)
+            {
+                switch (priority)
+                {
+                    case DataPriority.High:
+                        if (highUsed > 0) highUsed--;
+                        break;
+                    case DataPriority.Medium:
+                        if (mediumUsed > 0) mediumUsed--;
+                        break;
+                    case DataPriority.Low:
+                        if (lowUsed > 0) lowUsed--;
+                        break;
+                }
+                Monitor.PulseAll(_windowLock);
+            }
+        }
         private async Task WaitForAck(int seqNum)
         {
             var timeout = Task.Delay(5000); // 5秒ACK超时
@@ -404,8 +480,10 @@ namespace Client
             Action<int> ackHandler = null;
             ackHandler = (ackedSeq) =>
             {
-                if (ackedSeq == seqNum)
+                if (ackedSeq == seqNum && _pendingMessages.TryGetValue(seqNum, out var msg))
                 {
+                    ReleaseWindowSlot(msg.communicationData.Priority);
+
                     _pendingMessages.Remove(seqNum);
                     completionSource.TrySetResult(true);
                     AckReceived -= ackHandler; // 移除事件处理
