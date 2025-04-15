@@ -316,3 +316,19 @@ public class DependingMessage
     public DateTime FirstSentTime { get; set; }   // 新增首次发送时间
     public bool IsAck { get; set; }
 }
+public class RetryConfig
+{
+    public int MaxRetries { get; set; }
+    public int BaseDelayMs { get; set; }
+    public double BackoffFactor { get; set; }
+    public float PriorityWeight { get; set; }
+}
+
+public class PendingMessage
+{
+    public CommunicationData Data { get; init; }
+    public DateTime FirstSent { get; init; }
+    public DateTime LastSent { get; set; }
+    public int RetryCount { get; set; }
+    public float PriorityWeight { get; init; }
+}

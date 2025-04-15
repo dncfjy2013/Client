@@ -23,7 +23,7 @@ namespace Client
         private Socket _clientSocket;
         private bool _isConnected = false;
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
-        private readonly Dictionary<int, DependingMessage> _pendingMessages = new();
+
         private readonly Logger logger = Logger.GetInstance();
         private int _heartbeatCountout;
 
@@ -38,7 +38,6 @@ namespace Client
         private const int BufferReserve = 10;       // 动态调整缓冲区
         private readonly object _windowLock = new object();
         private const int WindowSize = 1000; // 窗口大小
-        private readonly Queue<int> _sendWindow = new Queue<int>(); // 发送窗口队列
         private readonly Dictionary<int, CommunicationData> _receiveBuffer = new(); // 接收缓冲区
         private int _isHeartAck = 0;
         private CancellationTokenSource _receiveCts;
@@ -58,6 +57,36 @@ namespace Client
             { DataPriority.High, 1 },
             { DataPriority.Medium, 1 },
             { DataPriority.Low, 1 }
+        };
+        public readonly ConcurrentDictionary<DataPriority, RetryConfig> _retryConfigs = new()
+        {
+            [DataPriority.High] = new RetryConfig
+            {
+                MaxRetries = 5,
+                BaseDelayMs = 300,
+                BackoffFactor = 1.5,
+                PriorityWeight = 1.0f
+            },
+            [DataPriority.Medium] = new RetryConfig
+            {
+                MaxRetries = 3,
+                BaseDelayMs = 500,
+                BackoffFactor = 2.0,
+                PriorityWeight = 0.7f
+            },
+            [DataPriority.Low] = new RetryConfig
+            {
+                MaxRetries = 1,
+                BaseDelayMs = 1000,
+                BackoffFactor = 3.0,
+                PriorityWeight = 0.3f
+            }
+        };
+        private readonly ConcurrentDictionary<DataPriority, ConcurrentDictionary<int, PendingMessage>> _priorityPendingMessages = new()
+        {
+            [DataPriority.High] = new(),
+            [DataPriority.Medium] = new(),
+            [DataPriority.Low] = new()
         };
         private readonly object _sequenceLock = new();
         // 新增字段记录已处理的中等优先级序列号
@@ -118,55 +147,109 @@ namespace Client
         {
             Task.Run(async () =>
             {
-                while (_isConnected)
+                var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+                while (await timer.WaitForNextTickAsync() && _isConnected)
                 {
-                    await Task.Delay(1000); // 每秒检查一次
-
-                    var now = DateTime.Now;
-                    var toResend = _pendingMessages
-                        .Where(p =>
-                            p.Value.communicationData.Priority <= DataPriority.Medium && // 只重传高和中优先级
-                            p.Value.RetryCount < GetMaxRetries(p.Value.communicationData.Priority) &&
-                            (now - p.Value.FirstSentTime).TotalMilliseconds > GetRetryDelay(p.Value.RetryCount, p.Value.communicationData.Priority))
-                        .ToList();
-
-                    foreach (var item in toResend)
-                    {
-                        try
-                        {
-                            Console.WriteLine($"Resending {item.Value.communicationData.Priority} priority Seq={item.Key}");
-                            await SendRawData(item.Value.communicationData);
-                            item.Value.RetryCount++;
-                        }
-                        catch (Exception ex)
-                        {
-                            HandleSendFailure(ex, item.Value.communicationData);
-                        }
-                    }
+                    await ProcessRetriesByPriority(DataPriority.High);
+                    await ProcessRetriesByPriority(DataPriority.Medium);
+                    await ProcessRetriesByPriority(DataPriority.Low);
                 }
             });
         }
+        public bool TryRemovePendingMessage(DataPriority priority, int seqNumber)
+        {
+            // 1. 检查是否存在该优先级的队列
+            if (!_priorityPendingMessages.TryGetValue(priority, out var priorityQueue))
+                return false;
 
-        private int GetMaxRetries(DataPriority priority)
+            // 2. 尝试从队列中移除指定键
+            return priorityQueue.TryRemove(seqNumber, out _);
+        }
+        private async Task ProcessRetriesByPriority(DataPriority priority)
+        {
+            if (!_priorityPendingMessages.TryGetValue(priority, out var messages) || messages.IsEmpty)
+                return;
+
+            var config = _retryConfigs[priority];
+            var now = DateTime.UtcNow;
+
+            var expiredMessages = messages
+                .Where(kvp =>
+                {
+                    var msg = kvp.Value;
+                    var delay = config.BaseDelayMs * Math.Pow(config.BackoffFactor, msg.RetryCount);
+                    return msg.RetryCount < config.MaxRetries &&
+                           (now - msg.LastSent).TotalMilliseconds > delay;
+                })
+                .OrderByDescending(kvp => kvp.Value.PriorityWeight)
+                .Take(GetMaxParallelRetries(priority))
+                .ToList();
+
+            var retryTasks = expiredMessages.Select(async kvp =>
+            {
+                var (seq, msg) = (kvp.Key, kvp.Value);
+                try
+                {
+                    msg.RetryCount++;
+                    msg.LastSent = now;
+
+                    await SendRawData(msg.Data);
+                    logger.LogInfo($"Resent {priority} seq={seq}, retry={msg.RetryCount}");
+                }
+                catch (Exception ex)
+                {
+                    HandleRetryFailure(priority, seq, ex);
+                }
+            });
+
+            await Task.WhenAll(retryTasks);
+        }
+        // 增强的错误处理
+        private void HandleRetryFailure(DataPriority priority, int seq, Exception ex)
+        {
+            if (_priorityPendingMessages[priority].TryGetValue(seq, out var msg))
+            {
+                if (msg.RetryCount >= _retryConfigs[priority].MaxRetries)
+                {
+                    _priorityPendingMessages[priority].TryRemove(seq, out _);
+                    logger.LogError($"Final retry failed for {priority} seq={seq}: {ex.Message}");
+
+                    if (priority == DataPriority.High)
+                        HandleCriticalFailure(ex);
+                }
+                else
+                {
+                    logger.LogWarning($"Retry failed for {priority} seq={seq}: {ex.Message}");
+                }
+            }
+        }
+
+        private void HandleCriticalFailure(Exception ex)
+        {
+            // 高优先级消息连续失败处理
+            Task.Run(async () =>
+            {
+                await Task.Delay(1000);
+                if (!_isConnected) return;
+
+                logger.LogError("Critical message delivery failed, initiating reconnect...");
+                await ReconnectAsync();
+            });
+        }
+
+        private async Task ReconnectAsync()
+        {
+            Disconnect();
+            await Connect();
+        }
+        private int GetMaxParallelRetries(DataPriority priority)
         {
             return priority switch
             {
-                DataPriority.High => 5,    // 高优先级最多重试5次
-                DataPriority.Medium => 3,  // 中优先级最多重试3次
-                _ => 0                    // 低优先级不重试
+                DataPriority.High => Environment.ProcessorCount * 2,
+                DataPriority.Medium => Environment.ProcessorCount,
+                _ => Math.Max(1, Environment.ProcessorCount / 2)
             };
-        }
-
-        private double GetRetryDelay(int retryCount, DataPriority priority)
-        {
-            var baseDelay = priority switch
-            {
-                DataPriority.High => 500,  // 高优先级基础延迟500ms
-                DataPriority.Medium => 1000, // 中优先级1s
-                _ => 2000                // 低优先级2s（实际上不会用到）
-            };
-
-            return baseDelay * Math.Pow(2, retryCount); // 指数退避
         }
 
         private void StartReceiveProcessing()
@@ -233,12 +316,15 @@ namespace Client
         {
             lock (_processedHighLock)
             {
+                if(!TryRemovePendingMessage(DataPriority.High, data.SeqNum))
+                {
+                    Console.WriteLine($"PendingMessage HIGH priority Seq={data.SeqNum}");
+                }
                 // 严格顺序处理
                 if (data.SeqNum == _priorityNextExpect[data.Priority]++)
                 {
                     Console.WriteLine($"Processing HIGH priority Seq={data.SeqNum}");
                     DeliverData(data);
-                    _pendingMessages.Remove(data.SeqNum);
                     // 处理缓冲的后续包
                     while (_receiveBuffer.TryGetValue(_priorityNextExpect[data.Priority], out var bufferedData))
                     {
@@ -265,6 +351,7 @@ namespace Client
         {
             lock (_processedMediumLock)
             {
+                TryRemovePendingMessage(DataPriority.Medium, data.SeqNum);
                 // 1. 重复数据包检查
                 if (_processedMediumSeqs.Contains(data.SeqNum))
                 {
@@ -491,12 +578,16 @@ namespace Client
             // 记录待确认消息（仅高和中优先级）
             if (data.Priority <= DataPriority.Medium)
             {
-                _pendingMessages[data.SeqNum] = new DependingMessage
+                var config = _retryConfigs[data.Priority];
+                var pending = new PendingMessage
                 {
-                    communicationData = data,
-                    FirstSentTime = DateTime.Now,
-                    RetryCount = 0
+                    Data = data,
+                    FirstSent = DateTime.UtcNow,
+                    LastSent = DateTime.UtcNow,
+                    PriorityWeight = config.PriorityWeight
                 };
+
+                _priorityPendingMessages[data.Priority].TryAdd(data.SeqNum, pending);
             }
 
             // 异步发送
