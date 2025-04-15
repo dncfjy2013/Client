@@ -24,7 +24,7 @@ namespace Client
         private bool _isConnected = false;
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
 
-        private readonly Logger logger;
+        private readonly Logger logger = new Logger();
         private int _heartbeatCountout;
 
         // 初始化信号量（在构造函数中）

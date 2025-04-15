@@ -59,7 +59,7 @@ namespace Client.utils
         private readonly LoggerConfig _config;
         private readonly Task _logWriterTask;
 
-        private Logger() : this(new LoggerConfig()) { }
+        public Logger() : this(new LoggerConfig()) { }
 
         public Logger(LoggerConfig config)
         {
@@ -186,10 +186,10 @@ namespace Client.utils
             return level switch
             {
                 LogLevel.Critical => ConsoleColor.DarkRed,
-                LogLevel.Error => ConsoleColor.Red,
-                LogLevel.Warning => ConsoleColor.Yellow,
-                LogLevel.Information => ConsoleColor.White,
-                LogLevel.Debug => ConsoleColor.Gray,
+                LogLevel.Error => ConsoleColor.DarkMagenta,
+                LogLevel.Warning => ConsoleColor.DarkYellow,
+                LogLevel.Information => ConsoleColor.DarkGreen,
+                LogLevel.Debug => ConsoleColor.DarkCyan,
                 LogLevel.Trace => ConsoleColor.DarkGray,
                 _ => ConsoleColor.Gray
             };
