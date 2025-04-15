@@ -10,6 +10,7 @@ namespace Client.Common.Log
     {
         Info,
         Warning,
-        Error
+        Error,
+        Debug
     }
 }

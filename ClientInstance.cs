@@ -24,7 +24,7 @@ namespace Client
         private bool _isConnected = false;
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
 
-        private readonly Logger logger = Logger.GetInstance();
+        private readonly Logger logger;
         private int _heartbeatCountout;
 
         // 初始化信号量（在构造函数中）
@@ -127,12 +127,12 @@ namespace Client
                 {
                     _clientSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                     await _clientSocket.ConnectAsync(new IPEndPoint(IPAddress.Parse(_serverIp), _port));
-                    Console.WriteLine($"Connected to server at {_serverIp}:{_port}");
+                    logger.LogInformation($"Connected to server at {_serverIp}:{_port}");
                     break;
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"server not at {_serverIp}:{_port}");
+                    logger.LogWarning($"server not at {_serverIp}:{_port}");
                 }
             }
             // 连接成功后启动心跳
@@ -150,6 +150,7 @@ namespace Client
                 var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
                 while (await timer.WaitForNextTickAsync() && _isConnected)
                 {
+                    logger.LogInformation("Start CheckResend ......");
                     await ProcessRetriesByPriority(DataPriority.High);
                     await ProcessRetriesByPriority(DataPriority.Medium);
                     await ProcessRetriesByPriority(DataPriority.Low);
@@ -160,15 +161,30 @@ namespace Client
         {
             // 1. 检查是否存在该优先级的队列
             if (!_priorityPendingMessages.TryGetValue(priority, out var priorityQueue))
+            {
+                logger.LogDebug($"Try Get {priority} priorityQueue failure");
                 return false;
+            }
 
             // 2. 尝试从队列中移除指定键
-            return priorityQueue.TryRemove(seqNumber, out _);
+            bool r = priorityQueue.TryRemove(seqNumber, out _);
+            if (!r)
+            {
+                logger.LogDebug($"Try Get seqNumber from {priority} Queue failure");
+            }
+
+            return r;
         }
         private async Task ProcessRetriesByPriority(DataPriority priority)
         {
             if (!_priorityPendingMessages.TryGetValue(priority, out var messages) || messages.IsEmpty)
-                return;
+            {
+                if (!messages.IsEmpty)
+                {
+                    logger.LogDebug($"Try Get seqNumber from {priority} PendingMessages Queue failure");
+                }
+                return; 
+            }
 
             var config = _retryConfigs[priority];
             var now = DateTime.UtcNow;
@@ -194,10 +210,11 @@ namespace Client
                     msg.LastSent = now;
 
                     await SendRawData(msg.Data);
-                    logger.LogInfo($"Resent {priority} seq={seq}, retry={msg.RetryCount}");
+                    logger.LogInformation($"Resent {priority} seq={seq}, retry={msg.RetryCount}");
                 }
                 catch (Exception ex)
                 {
+                    logger.LogError($"Resent {priority} seq={seq}, retry={msg.RetryCount} failure");
                     HandleRetryFailure(priority, seq, ex);
                 }
             });
@@ -232,13 +249,14 @@ namespace Client
                 await Task.Delay(1000);
                 if (!_isConnected) return;
 
-                logger.LogError("Critical message delivery failed, initiating reconnect...");
+                logger.LogCritical("Critical message delivery failed, initiating reconnect...");
                 await ReconnectAsync();
             });
         }
 
         private async Task ReconnectAsync()
         {
+            logger.LogCritical("Reconnect......");
             Disconnect();
             await Connect();
         }
@@ -267,11 +285,12 @@ namespace Client
                             Interlocked.Exchange(ref _isHeartAck, 1); // 原子操作
                             try
                             {
+                                logger.LogDebug($"Receive data {data.Priority} {data.SeqNum}, waiting process");
                                 ProcessReceivedData(data);
                             }
                             catch (Exception ex)
                             {
-                                logger.LogTemp(LogLevel.Error, "Data processing failed");
+                                logger.LogError("Data processing failed");
                             }
                         }
                         await Task.Delay(100, _receiveCts.Token);
@@ -280,7 +299,7 @@ namespace Client
                 catch (OperationCanceledException) { /* 正常取消 */ }
                 catch (Exception ex)
                 {
-                    logger.LogTemp(LogLevel.Error, "Receive loop terminated unexpectedly");
+                    logger.LogError("Receive loop terminated unexpectedly");
                     Disconnect();
                 }
             }, _receiveCts.Token);
@@ -318,19 +337,19 @@ namespace Client
             {
                 if(!TryRemovePendingMessage(DataPriority.High, data.SeqNum))
                 {
-                    Console.WriteLine($"PendingMessage HIGH priority Seq={data.SeqNum}");
+                    logger.LogTrace($"PendingMessage HIGH priority Seq={data.SeqNum}");
                 }
                 // 严格顺序处理
                 if (data.SeqNum == _priorityNextExpect[data.Priority]++)
                 {
-                    Console.WriteLine($"Processing HIGH priority Seq={data.SeqNum}");
+                    logger.LogInformation($"Processing HIGH priority Seq={data.SeqNum}");
                     DeliverData(data);
                     // 处理缓冲的后续包
                     while (_receiveBuffer.TryGetValue(_priorityNextExpect[data.Priority], out var bufferedData))
                     {
                         if (bufferedData.SeqNum == _priorityNextExpect[data.Priority] + 1)
                         {
-                            Console.WriteLine($"Processing buffered HIGH priority Seq={_priorityNextExpect[data.Priority]}");
+                            logger.LogInformation($"Processing buffered HIGH priority Seq={_priorityNextExpect[data.Priority]}");
                             _receiveBuffer.Remove(_priorityNextExpect[data.Priority]);
                             _priorityNextExpect[data.Priority]++;
                             DeliverData(bufferedData);
@@ -341,7 +360,7 @@ namespace Client
                 {
                     // 缓存乱序包
                     _receiveBuffer[data.SeqNum] = data;
-                    Console.WriteLine($"Buffered HIGH priority Seq={data.SeqNum}");
+                    logger.LogInformation($"Buffered HIGH priority Seq={data.SeqNum}");
                 }
                 // SeqNum < _nextExpectedSeq 的包视为重复包，忽略
             }
@@ -355,7 +374,7 @@ namespace Client
                 // 1. 重复数据包检查
                 if (_processedMediumSeqs.Contains(data.SeqNum))
                 {
-                    Console.WriteLine($"Duplicate MEDIUM seq={data.SeqNum}");
+                    logger.LogInformation($"Duplicate MEDIUM seq={data.SeqNum}");
                     return;
                 }
 
@@ -378,7 +397,7 @@ namespace Client
                     if (!_mediumBuffer.ContainsKey(data.SeqNum))
                     {
                         _mediumBuffer.Add(data.SeqNum, data);
-                        Console.WriteLine($"Buffered MEDIUM seq={data.SeqNum} (window:{windowStart}-{windowEnd})");
+                        logger.LogInformation($"Buffered MEDIUM seq={data.SeqNum} (window:{windowStart}-{windowEnd})");
                     }
                 }
 
@@ -394,7 +413,7 @@ namespace Client
 
             // 处理当前数据包
             DeliverData(data);
-            Console.WriteLine($"Processed MEDIUM seq={data.SeqNum}");
+            logger.LogInformation($"Processed MEDIUM seq={data.SeqNum}");
 
             // 更新期望值：找到最大的连续序列号
             while (_processedMediumSeqs.Contains(expected))
@@ -416,7 +435,7 @@ namespace Client
                 _mediumBuffer.Remove(expected);
                 _processedMediumSeqs.Add(expected);
                 expected++;
-                Console.WriteLine($"Process buffered MEDIUM seq={expected - 1}");
+                logger.LogInformation($"Process buffered MEDIUM seq={expected - 1}");
             }
             _priorityNextExpect[DataPriority.Medium] = expected;
         }
@@ -446,7 +465,7 @@ namespace Client
                 _ => _mediumWindowSize
             };
 
-            Console.WriteLine($"Adjusted window size to {_mediumWindowSize}");
+            logger.LogInformation($"Adjusted window size to {_mediumWindowSize}");
             _lastWindowAdjustTime = DateTime.Now;
         }
 
@@ -481,7 +500,7 @@ namespace Client
             lock (_processedLowLock)
             {
                 // 低优先级：直接处理，不保证顺序
-                Console.WriteLine($"Processing LOW priority Seq={data.SeqNum}");
+                logger.LogInformation($"Processing LOW priority Seq={data.SeqNum}");
                 DeliverData(data);
             }
         }
@@ -489,7 +508,7 @@ namespace Client
         private void DeliverData(CommunicationData data)
         {
             // 实际数据处理逻辑
-            Console.WriteLine($"Delivering: {data.Message}");
+            logger.LogInformation($"Delivering: {data.Message}");
 
             // 发送ACK（对高和中优先级数据）
             if (data.Priority <= DataPriority.Medium)
@@ -520,9 +539,12 @@ namespace Client
 
                         if (_skipNextHeartbeat)
                         {
+                            logger.LogDebug("Skip Heartbeat");
                             _skipNextHeartbeat = false;
                             continue;
                         }
+
+                        logger.LogDebug("Start Heartbeat");
 
                         var heartbeatData = new CommunicationData
                         {
@@ -543,9 +565,12 @@ namespace Client
                         if (!ackReceived.IsCompleted)
                         {
                             Interlocked.Increment(ref _heartbeatCountout);
+                            logger.LogWarning($"Heartbeat is not complete, Current missed: {_heartbeatCountout}");
+
                             if (_heartbeatCountout >= MaxMissedHeartbeats)
                             {
-                                Disconnect();
+                                logger.LogCritical("Heartbeat larger than MaxMissedHeartbeats");
+                                await ReconnectAsync();
                                 _heartbeatCts.Cancel();
                             }
                         }
@@ -558,6 +583,7 @@ namespace Client
                 catch (OperationCanceledException) { /* 正常取消 */ }
                 catch (Exception ex)
                 {
+                    logger.LogCritical($"Heartbeat error, {ex.Message}");
                     Disconnect();
                     _heartbeatCts.Cancel();
                 }
@@ -596,16 +622,17 @@ namespace Client
                 try
                 {
                     await SendRawData(data);
-                    Console.WriteLine($"Sent: {data.InfoType}, Seq={data.SeqNum}, Pri={data.Priority}");
+                    logger.LogInformation($"Sent: {data.InfoType}, Seq={data.SeqNum}, Pri={data.Priority}");
 
                     // 高优先级数据需要等待ACK或重试
                     if (data.Priority == DataPriority.High)
                     {
-                        await WaitForAck(data.SeqNum);
+                        await WaitForAck(data.SeqNum, data.Priority);
                     }
                 }
                 catch (Exception ex)
                 {
+                    logger.LogError($"Sent: {data.InfoType}, Seq={data.SeqNum}, Pri={data.Priority}");
                     HandleSendFailure(ex, data);
                 }
             });
@@ -643,7 +670,7 @@ namespace Client
                             // 高优先级动态上限
                             int highDynamicMax = (int)(WindowSize * HighBaseRatio +
                                 (WindowSize * 0.2f * (1 - highUsageFactor)));
-
+                            logger.LogTrace($"Currrent highDynamicMax: {highDynamicMax}, used {highUsed}");
                             if (highUsed < highDynamicMax && windowRemain > 0)
                             {
                                 highUsed++;
@@ -654,7 +681,7 @@ namespace Client
                         case DataPriority.Medium:
                             // 中优先级可用空间 = 总剩余 - 低预留 - 缓冲区
                             int mediumAvailable = WindowSize - highUsed - lowMax - BufferReserve;
-
+                            logger.LogTrace($"Currrent mediumAvailable: {mediumAvailable}, used {mediumUsed}");
                             if (mediumUsed < mediumAvailable && windowRemain > 0)
                             {
                                 mediumUsed++;
@@ -665,7 +692,7 @@ namespace Client
                         case DataPriority.Low:
                             // 低优先级强制保留区间
                             int lowAvailable = Math.Min(lowMax - lowUsed, windowRemain);
-
+                            logger.LogTrace($"Currrent lowAvailable: {lowAvailable}, used {lowUsed}");
                             if (lowAvailable > 0)
                             {
                                 lowUsed++;
@@ -698,7 +725,7 @@ namespace Client
                 Monitor.PulseAll(_windowLock);
             }
         }
-        private async Task WaitForAck(int seqNum)
+        private async Task WaitForAck(int seqNum, DataPriority priority)
         {
             var timeout = Task.Delay(5000); // 5秒ACK超时
             var completionSource = new TaskCompletionSource<bool>();
@@ -707,11 +734,9 @@ namespace Client
             Action<int> ackHandler = null;
             ackHandler = (ackedSeq) =>
             {
-                if (ackedSeq == seqNum && _pendingMessages.TryGetValue(seqNum, out var msg))
+                if (TryRemovePendingMessage(priority, seqNum))
                 {
-                    ReleaseWindowSlot(msg.communicationData.Priority);
-
-                    _pendingMessages.Remove(seqNum);
+                    ReleaseWindowSlot(priority);
                     completionSource.TrySetResult(true);
                     AckReceived -= ackHandler; // 移除事件处理
                 }
@@ -724,7 +749,7 @@ namespace Client
             if (completedTask == timeout)
             {
                 AckReceived -= ackHandler;
-                throw new TimeoutException($"ACK for seq {seqNum} not received");
+                logger.LogWarning($"ACK for seq {priority} {seqNum} not received");
             }
         }
 
@@ -749,7 +774,6 @@ namespace Client
             return ack;
         }
         // 优化后的接收方法
-        // 修改后的接收方法
         private async Task<CommunicationData> ReceiveRawData(CancellationToken token)
         {
             try
@@ -772,7 +796,7 @@ namespace Client
                 if (!ProtocolHeader.TryFromBytes(headerBuffer, out ProtocolHeader header) ||
                     !config.SupportedVersions.Contains(header.Version))
                 {
-                    Console.WriteLine("Invalid protocol header or unsupported version");
+                    logger.LogWarning("Invalid protocol header or unsupported version");
                     return null;
                 }
 
@@ -798,24 +822,25 @@ namespace Client
             }
             catch (OperationCanceledException)
             {
-                Console.WriteLine("Receive operation timed out");
+                logger.LogWarning("Receive operation timed out");
             }
             catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
             {
-                Console.WriteLine($"Connection reset by server: {ex.Message}");
+                logger.LogCritical($"Connection reset by server: {ex.Message}");
                 Disconnect();
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Receive error: {ex.Message}");
+                logger.LogWarning($"Receive error: {ex.Message}");
             }
             return null;
         }
         // 新增异常处理统一方法
         private void HandleSendFailure(Exception ex, CommunicationData data)
         {
-            Console.WriteLine($"Error sending SeqNum={data.SeqNum}: {ex.Message}");
-            _pendingMessages.Remove(data.SeqNum);
+            logger.LogWarning($"Error sending SeqNum={data.SeqNum}: {ex.Message}");
+
+            TryRemovePendingMessage(data.Priority, data.SeqNum);
 
             // 检查连接状态
             if (!_isConnected) return;
@@ -825,11 +850,11 @@ namespace Client
             {
                 Disconnect();
                 Connect().Wait();
-                Console.WriteLine("Reconnected to server");
+                logger.LogCritical("Reconnected to server");
             }
             catch (Exception reconnectEx)
             {
-                Console.WriteLine($"Reconnect failed: {reconnectEx.Message}");
+                logger.LogCritical($"Reconnect failed: {reconnectEx.Message}");
             }
         }
 
@@ -840,7 +865,7 @@ namespace Client
         {
             var fileInfo = new FileInfo(filePath);
             if (!fileInfo.Exists)
-                throw new FileNotFoundException("File not found", filePath);
+                logger.LogWarning($"File not found {filePath}");
 
             var fileId = Guid.NewGuid().ToString();
             var chunkSize = CalculateChunkSize(fileInfo.Length);
@@ -912,6 +937,7 @@ namespace Client
             catch (Exception ex)
             {
                 UpdateProgress(session, TransferStatus.Failed, ex.Message);
+                logger.LogError($"Transfer failed, {session.FileName} {session.FileId}");
                 throw;
             }
             finally
@@ -999,9 +1025,7 @@ namespace Client
         public void Disconnect()
         {
             _isConnected = false;
-
             // 清除所有待处理消息
-            _pendingMessages.Clear();
             _receiveCts?.Cancel();
             _heartbeatCts?.Cancel();
             // 安全关闭socket
@@ -1016,7 +1040,7 @@ namespace Client
                 _clientSocket?.Close();
             }
 
-            Console.WriteLine("Connection closed gracefully");
+            logger.LogCritical("Connection closed gracefully");
         }
 
         public void Dispose()
