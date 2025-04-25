@@ -28,41 +28,18 @@ public class CommunicationData
     public string MD5Hash { get; set; }         // 文件整体MD5
     public string ChunkMD5 { get; set; }        // 当前块MD5
 }
-public class FileTransferProgress
-{
-    public string FileId { get; set; }
-    public string FileName { get; set; }
-    public long TotalBytes { get; set; }
-    public long TransferredBytes { get; set; }
-    public double Progress => TotalBytes > 0 ? (double)TransferredBytes / TotalBytes : 0;
-    public TransferStatus Status { get; set; }
-}
-public class FileTransferSession
-{
-    public string FileId { get; set; }
-    public string FileName { get; set; }
-    public string FilePath { get; set; }
-    public long FileSize { get; set; }
-    public int TotalChunks { get; set; }
-    public int ChunkSize { get; set; }
-    public DataPriority Priority { get; set; }
-    public long TransferredBytes;
-    public string FileHash { get; set; }
-}
-public enum TransferStatus
-{
-    Preparing,
-    Transferring,
-    Verifying,
-    Completed,
-    Failed,
-    Canceled
-}
 public enum DataPriority
 {
     High = 0,    // 高优先级，需要严格SEQ
     Medium = 1,  // 中等优先级
     Low = 2      // 低优先级，宽松SEQ
+}
+public enum InfoType
+{
+    HeartBeat = 0,
+    Normal = 1,
+    File = 2,
+    Ack = 3,
 }
 // 协议配置类（新增）
 public class ProtocolConfiguration
@@ -309,26 +286,4 @@ public static class ProtocolExtensions
         return calculatedChecksum == packet.Checksum;
     }
 }
-public class DependingMessage
-{
-    public CommunicationData communicationData { get; set; }
-    public int RetryCount { get; set; } = 0;      // 新增重试计数器
-    public DateTime FirstSentTime { get; set; }   // 新增首次发送时间
-    public bool IsAck { get; set; }
-}
-public class RetryConfig
-{
-    public int MaxRetries { get; set; }
-    public int BaseDelayMs { get; set; }
-    public double BackoffFactor { get; set; }
-    public float PriorityWeight { get; set; }
-}
 
-public class PendingMessage
-{
-    public CommunicationData Data { get; init; }
-    public DateTime FirstSent { get; init; }
-    public DateTime LastSent { get; set; }
-    public int RetryCount { get; set; }
-    public float PriorityWeight { get; init; }
-}

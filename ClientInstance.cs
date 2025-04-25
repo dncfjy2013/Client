@@ -37,7 +37,7 @@ namespace Client
         private const float LowMaxRatio = 0.10f;    // 低优先级最高比例
         private const int BufferReserve = 10;       // 动态调整缓冲区
         private readonly object _windowLock = new object();
-        private const int WindowSize = 1000; // 窗口大小
+        private const int WindowSize = 1000000; // 窗口大小
         private readonly Dictionary<int, CommunicationData> _receiveBuffer = new(); // 接收缓冲区
         private int _isHeartAck = 0;
         private CancellationTokenSource _receiveCts;
