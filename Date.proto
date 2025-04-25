@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package Protocol;
+
+enum InfoType {
+  HEART_BEAT = 0;
+  NORMAL = 1;
+  FILE = 2;
+  ACK = 3;
+}
+
+enum DataPriority {
+  HIGH = 0;
+  MEDIUM = 1;
+  LOW = 2;
+}
+
+message CommunicationData {
+  string message = 1;
+  InfoType info_type = 2;
+  int32 seq_num = 3;
+  int32 ack_num = 4;
+  DataPriority priority = 5;
+  
+  // File transfer fields
+  string file_id = 6;
+  string file_name = 7;
+  int64 file_size = 8;
+  int32 chunk_index = 9;
+  int32 total_chunks = 10;
+  bytes chunk_data = 11;
+  string md5_hash = 12;
+  string chunk_md5 = 13;
+}
+
+message ProtocolHeader {
+  uint32 version = 1;
+  bytes reserved = 2;
+  uint32 message_length = 3;
+}
+
+message ProtocolPacket {
+  ProtocolHeader header = 1;
+  CommunicationData data = 2;
+  uint32 checksum = 3;
+}

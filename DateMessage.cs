@@ -1,84 +1,63 @@
-﻿using Client.Common;
-using Microsoft.VisualBasic.FileIO;
-using System;
+﻿using System;
 using System.Buffers;
 using System.Collections.Concurrent;
-using System.IO;
-using System.Runtime.Serialization.Formatters.Binary;
+using System.Net.Sockets;
 using System.Text;
-using System.Text.Json;
+using Google.Protobuf;
+using Protocol;
 
-[Serializable]
-public class CommunicationData
+// 文件传输信息类
+public class FileTransferInfo
 {
-    public string Message { get; set; }
-    public InfoType InfoType { get; set; }
-    // 新增可靠性字段
-    public int SeqNum { get; set; }     // 序列号
-    public int AckNum { get; set; }     // 确认号
-    public DataPriority Priority { get; set; } = DataPriority.Medium;
-
-    // 文件传输专用字段
-    public string FileId { get; set; }          // 文件唯一标识
-    public string FileName { get; set; }        // 文件名
-    public long FileSize { get; set; }          // 文件总大小
-    public int ChunkIndex { get; set; }         // 当前块索引
-    public int TotalChunks { get; set; }        // 总块数
-    public byte[] ChunkData { get; set; }       // 块数据
-    public string MD5Hash { get; set; }         // 文件整体MD5
-    public string ChunkMD5 { get; set; }        // 当前块MD5
+    public string FileId { get; set; }
+    public string FileName { get; set; }
+    public long FileSize { get; set; }
+    public int TotalChunks { get; set; }
+    public int ChunkSize { get; set; }
+    public string FilePath { get; set; }
+    public ConcurrentDictionary<int, byte[]> ReceivedChunks { get; set; }
 }
-public enum DataPriority
-{
-    High = 0,    // 高优先级，需要严格SEQ
-    Medium = 1,  // 中等优先级
-    Low = 2      // 低优先级，宽松SEQ
-}
-public enum InfoType
-{
-    HeartBeat = 0,
-    Normal = 1,
-    File = 2,
-    Ack = 3,
-}
-// 协议配置类（新增）
+// 协议配置类
+// 协议配置类
 public class ProtocolConfiguration
 {
-    public IDataSerializer DataSerializer { get; set; } = new JsonSerializerAdapter();
+    public IDataSerializer DataSerializer { get; set; } = new ProtobufSerializerAdapter();
     public IChecksumCalculator ChecksumCalculator { get; set; } = new Crc16Calculator();
-    public byte[] SupportedVersions { get; set; } = new[] { ProtocolHeader.CurrentVersion };
+    public byte[] SupportedVersions { get; set; } = new byte[] { 0x01 };
     public int MaxPacketSize { get; set; } = 1024 * 1024; // 1MB
     public Encoding TextEncoding { get; set; } = Encoding.UTF8;
 }
 
-// 数据序列化接口（新增）
+// 数据序列化接口
 public interface IDataSerializer
 {
-    byte[] Serialize<T>(T data);
-    T Deserialize<T>(byte[] data);
+    byte[] Serialize<T>(T data) where T : IMessage<T>;
+    T Deserialize<T>(byte[] data) where T : IMessage<T>, new();
 }
 
-// JSON序列化适配器（新增）
-public class JsonSerializerAdapter : IDataSerializer
+// Protobuf序列化适配器
+public class ProtobufSerializerAdapter : IDataSerializer
 {
-    public byte[] Serialize<T>(T data)
+    public byte[] Serialize<T>(T data) where T : IMessage<T>
     {
-        return JsonSerializer.SerializeToUtf8Bytes(data);
+        return data.ToByteArray();
     }
 
-    public T Deserialize<T>(byte[] data)
+    public T Deserialize<T>(byte[] data) where T : IMessage<T>, new()
     {
-        return JsonSerializer.Deserialize<T>(data);
+        var message = new T();
+        message.MergeFrom(data);
+        return message;
     }
 }
 
-// 校验和计算接口（新增）
+// 校验和计算接口
 public interface IChecksumCalculator
 {
     ushort Calculate(byte[] data);
 }
 
-// CRC16优化实现（改进）
+// CRC16 优化实现
 public class Crc16Calculator : IChecksumCalculator
 {
     private static readonly ushort[] CrcTable = GenerateCrcTable();
@@ -118,172 +97,327 @@ public class Crc16Calculator : IChecksumCalculator
     }
 }
 
-// 协议头定义（增强）
-public class ProtocolHeader
+// 协议头定义
+// 定义扩展方法的静态类
+// 优化后的 ProtocolHeaderExtensions 类，使用 Varint 编码 message_length
+public static class ProtocolHeaderExtensions
 {
-    public const byte CurrentVersion = 0x01;
-
-    public byte Version { get; set; }
-    public byte[] Reserved { get; set; } = new byte[3];
-    public int MessageLength { get; set; }
-
-    public byte[] ToBytes()
+    public static byte[] ToBytes(this Protocol.ProtocolHeader header)
     {
-        var header = new byte[1 + Reserved.Length + sizeof(int)];
-        header[0] = Version;
-        Buffer.BlockCopy(Reserved, 0, header, 1, Reserved.Length);
-        Buffer.BlockCopy(BitConverter.GetBytes(MessageLength), 0, header, 4, sizeof(int));
-        return header;
+        if (header == null)
+        {
+            throw new ArgumentNullException(nameof(header));
+        }
+
+        var ms = new MemoryStream();
+        // 版本号 (1字节)
+        ms.WriteByte((byte)header.Version);
+
+        // 保留字段 (3字节) - 处理null或不足3字节的情况
+        byte[] reservedBytes = header.Reserved?.ToByteArray() ?? new byte[3];
+        if (reservedBytes.Length < 3)
+        {
+            Array.Resize(ref reservedBytes, 3);
+        }
+        ms.Write(reservedBytes, 0, 3);
+
+        // 消息长度 (Varint 编码)
+        var lengthBytes = EncodeVarint((uint)header.MessageLength);
+        ms.Write(lengthBytes, 0, lengthBytes.Length);
+
+        return ms.ToArray();
     }
 
-    public static bool TryFromBytes(byte[] data, out ProtocolHeader header)
+    public static bool TryFromBytes(byte[] data, out Protocol.ProtocolHeader result)
     {
-        header = null;
-        if (data?.Length != 8) return false;
-
-        try
+        result = new Protocol.ProtocolHeader
         {
-            header = new ProtocolHeader
-            {
-                Version = data[0],
-                Reserved = new byte[3],
-                MessageLength = BitConverter.ToInt32(data, 4)
-            };
-            return true;
-        }
-        catch
+            // 设置默认的3字节保留字段
+            Reserved = ByteString.CopyFrom(new byte[3])
+        };
+
+        if (data == null || data.Length < 4)
         {
             return false;
         }
+
+        try
+        {
+            result.Version = data[0];
+            result.Reserved = ByteString.CopyFrom(data, 1, 3);
+
+            int index = 4;
+            result.MessageLength = DecodeVarint(data, ref index);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Header parse error: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static byte[] EncodeVarint(uint value)
+    {
+        var bytes = new List<byte>();
+        do
+        {
+            byte temp = (byte)(value & 0x7F);
+            value >>= 7;
+            if (value != 0)
+            {
+                temp |= 0x80;
+            }
+            bytes.Add(temp);
+        } while (value != 0);
+        return bytes.ToArray();
+    }
+
+    private static uint DecodeVarint(byte[] data, ref int index)
+    {
+        uint result = 0;
+        int shift = 0;
+        byte b;
+        do
+        {
+            if (index >= data.Length)
+            {
+                throw new IndexOutOfRangeException("Varint decoding error: unexpected end of data");
+            }
+            b = data[index++];
+            result |= (uint)(b & 0x7F) << shift;
+            shift += 7;
+        } while ((b & 0x80) != 0);
+        return result;
     }
 }
 
-// 协议数据包封装（增强）
-public class ProtocolPacket
+// 协议数据包封装
+public class ProtocolPacketWrapper
 {
-    private static readonly ConcurrentQueue<byte[]> BufferPool = new ConcurrentQueue<byte[]>();
+    private readonly Protocol.ProtocolPacket _packet;
     private readonly ProtocolConfiguration _config;
+    private static readonly ArrayPool<byte> BufferPool = ArrayPool<byte>.Shared;
 
-    public ProtocolPacket(ProtocolConfiguration config = null)
+    public ProtocolPacketWrapper(Protocol.ProtocolPacket packet, ProtocolConfiguration config = null)
     {
+        _packet = packet ?? throw new ArgumentNullException(nameof(packet));
         _config = config ?? new ProtocolConfiguration();
     }
 
-    public ProtocolHeader Header { get; set; }
-    public CommunicationData Data { get; set; }
-    public ushort Checksum { get; set; }
-
     public byte[] ToBytes()
     {
-        // 使用对象池减少内存分配
-        if (!BufferPool.TryDequeue(out var buffer))
-        {
-            buffer = ArrayPool<byte>.Shared.Rent(_config.MaxPacketSize);
-        }
-
+        byte[] buffer = BufferPool.Rent(_config.MaxPacketSize);
         try
         {
-            // 序列化业务数据
-            byte[] jsonData = _config.DataSerializer.Serialize(Data);
+            // 1. 验证数据包完整性
+            ValidatePacket();
 
-            // 计算校验和
-            Checksum = _config.ChecksumCalculator.Calculate(jsonData);
+            // 2. 序列化数据部分
+            byte[] protoData = SerializeData();
 
-            // 构建完整数据包
-            int payloadLength = jsonData.Length + sizeof(ushort);
-            byte[] payloadWithChecksum = new byte[payloadLength];
-            Buffer.BlockCopy(jsonData, 0, payloadWithChecksum, 0, jsonData.Length);
-            Buffer.BlockCopy(BitConverter.GetBytes(Checksum), 0, payloadWithChecksum, jsonData.Length, sizeof(ushort));
+            // 3. 计算校验和
+            uint checksum = CalculateChecksum(protoData);
 
-            // 更新协议头信息
-            Header.MessageLength = payloadLength;
-            byte[] headerBytes = Header.ToBytes();
+            // 4. 更新头部长度信息
+            UpdateHeaderLength(protoData);
 
-            // 合并协议头和负载数据
-            int totalLength = headerBytes.Length + payloadLength;
-            Buffer.BlockCopy(headerBytes, 0, buffer, 0, headerBytes.Length);
-            Buffer.BlockCopy(payloadWithChecksum, 0, buffer, headerBytes.Length, payloadLength);
+            // 5. 序列化头部
+            byte[] headerBytes = SerializeHeader();
 
-            return buffer.Take(totalLength).ToArray();
+            // 6. 组装完整数据包
+            return AssemblePacket(buffer, headerBytes, protoData, checksum);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Packet serialization error: {ex}");
+            throw new ProtocolSerializationException("Failed to serialize protocol packet", ex);
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            BufferPool.Return(buffer);
         }
     }
 
-    public static async Task<(bool Success, ProtocolPacket Packet)> TryFromBytesAsync(byte[] data, ProtocolConfiguration config)
+    private void ValidatePacket()
     {
-        if (data?.Length < 8) return (false, null);
+        if (_packet?.Data == null)
+        {
+            throw new ProtocolSerializationException("Packet data is null");
+        }
+
+        if (_packet.Header == null)
+        {
+            throw new ProtocolSerializationException("Packet header is null");
+        }
+    }
+
+    private byte[] SerializeData()
+    {
+        try
+        {
+            byte[] protoData = _config.DataSerializer.Serialize(_packet.Data);
+            if (protoData == null || protoData.Length == 0)
+            {
+                throw new ProtocolSerializationException("Serialized data is empty");
+            }
+            return protoData;
+        }
+        catch (Exception ex)
+        {
+            throw new ProtocolSerializationException("Failed to serialize packet data", ex);
+        }
+    }
+
+    private uint CalculateChecksum(byte[] protoData)
+    {
+        try
+        {
+            return (uint)_config.ChecksumCalculator.Calculate(protoData);
+        }
+        catch (Exception ex)
+        {
+            throw new ProtocolSerializationException("Failed to calculate checksum", ex);
+        }
+    }
+
+    private void UpdateHeaderLength(byte[] protoData)
+    {
+        _packet.Header.MessageLength = (uint)(protoData.Length + sizeof(uint));
+    }
+
+    private byte[] SerializeHeader()
+    {
+        try
+        {
+            // 确保 Reserved 字段不为 null
+            if (_packet.Header.Reserved == null)
+            {
+                _packet.Header.Reserved = ByteString.CopyFrom(new byte[3]);
+            }
+
+            byte[] headerBytes = _packet.Header.ToBytes();
+            return headerBytes;
+        }
+        catch (Exception ex)
+        {
+            throw new ProtocolSerializationException("Failed to serialize header", ex);
+        }
+    }
+
+    private byte[] AssemblePacket(byte[] buffer, byte[] headerBytes, byte[] protoData, uint checksum)
+    {
+        int totalLength = headerBytes.Length + protoData.Length + sizeof(uint);
+        if (totalLength > _config.MaxPacketSize)
+        {
+            throw new ProtocolSerializationException(
+                $"Packet size {totalLength} exceeds maximum allowed size {_config.MaxPacketSize}");
+        }
 
         try
         {
-            // 解析协议头
-            if (!ProtocolHeader.TryFromBytes(data.Take(8).ToArray(), out ProtocolHeader header))
-                return (false, null);
+            Array.Copy(headerBytes, 0, buffer, 0, headerBytes.Length);
+            Array.Copy(protoData, 0, buffer, headerBytes.Length, protoData.Length);
+            byte[] checksumBytes = BitConverter.GetBytes(checksum);
+            Array.Copy(checksumBytes, 0, buffer, headerBytes.Length + protoData.Length, checksumBytes.Length);
 
-            // 版本兼容性检查
-            if (!config.SupportedVersions.Contains(header.Version))
-                return (false, null);
+            return buffer.AsSpan(0, totalLength).ToArray();
+        }
+        catch (Exception ex)
+        {
+            throw new ProtocolSerializationException("Failed to assemble packet", ex);
+        }
+    }
 
-            // 提取负载数据
-            byte[] payload = data.Skip(8).ToArray();
+    public static (bool Success, Protocol.ProtocolPacket Packet, string Error) TryFromBytes(byte[] data, ProtocolConfiguration config = null)
+    {
+        config ??= new ProtocolConfiguration();
+        if (data == null || data.Length < 4)
+        {
+            return (false, null, "Data length too short");
+        }
+        try
+        {
+            // 1. 解析头部
+            if (!ProtocolHeaderExtensions.TryFromBytes(data, out var header))
+            {
+                return (false, null, "Invalid header format");
+            }
 
-            // 验证数据长度
-            if (payload.Length != header.MessageLength)
-                return (false, null);
+            // 2. 版本检查
+            if (!config.SupportedVersions.Contains((byte)header.Version))
+            {
+                return (false, null, $"Unsupported version: {header.Version}");
+            }
 
-            // 异步校验和验证
-            ushort receivedChecksum = BitConverter.ToUInt16(payload, payload.Length - sizeof(ushort));
-            byte[] jsonData = payload.Take(payload.Length - sizeof(ushort)).ToArray();
+            // 3. 检查数据长度
+            int expectedLength = 4 + (int)header.MessageLength;
+            if (data.Length < expectedLength)
+            {
+                return (false, null, $"Data length {data.Length} less than expected {expectedLength}");
+            }
 
-            ushort calculatedChecksum = await Task.Run(() =>
-                config.ChecksumCalculator.Calculate(jsonData));
+            // 4. 提取有效载荷
+            byte[] payload = data.Skip(4).Take((int)header.MessageLength).ToArray();
+
+            // 5. 提取校验和和数据
+            uint receivedChecksum = BitConverter.ToUInt32(payload, payload.Length - sizeof(uint));
+            byte[] protoData = payload.Take(payload.Length - sizeof(uint)).ToArray();
+
+            // 6. 验证校验和
+            uint calculatedChecksum = (uint)config.ChecksumCalculator.Calculate(protoData);
 
             if (receivedChecksum != calculatedChecksum)
-                return (false, null);
+            {
+                return (false, null, $"Checksum mismatch: {receivedChecksum} != {calculatedChecksum}");
+            }
 
-            // 异步反序列化
-            CommunicationData communicationData = await Task.Run(() =>
-                config.DataSerializer.Deserialize<CommunicationData>(jsonData));
+            // 7. 反序列化数据
+            var communicationData = config.DataSerializer.Deserialize<Protocol.CommunicationData>(protoData);
 
-            var packet = new ProtocolPacket(config)
+            return (true, new Protocol.ProtocolPacket
             {
                 Header = header,
                 Data = communicationData,
                 Checksum = receivedChecksum
-            };
-
-            return (true, packet);
+            }, string.Empty);
         }
-        catch
+        catch (Exception ex)
         {
-            return (false, null);
+            return (false, null, $"Processing error: {ex.Message}");
         }
     }
 }
 
-// 扩展方法（新增）
+// 自定义异常类
+public class ProtocolSerializationException : Exception
+{
+    public ProtocolSerializationException(string message) : base(message) { }
+    public ProtocolSerializationException(string message, Exception inner) : base(message, inner) { }
+}
+
+// 扩展方法
 public static class ProtocolExtensions
 {
-    public static async Task<ProtocolPacket> CreatePacketAsync(this CommunicationData data,
-                                                             ProtocolConfiguration config = null)
+    public static async System.Threading.Tasks.Task<ProtocolPacketWrapper> CreatePacketAsync(this Protocol.CommunicationData data,
+                                                                                              ProtocolConfiguration config = null)
     {
-        var packet = new ProtocolPacket(config)
+        var packet = new ProtocolPacketWrapper(new Protocol.ProtocolPacket()
         {
-            Header = new ProtocolHeader { Version = ProtocolHeader.CurrentVersion },
+            Header = new Protocol.ProtocolHeader { Version = 0x01 },
             Data = data
-        };
-        return new ProtocolPacket(config) { Data = data, Header = packet.Header };
+        }, config);
+
+        return packet;
     }
 
-    public static async Task<bool> ValidatePacketAsync(this ProtocolPacket packet,
-                                                     ProtocolConfiguration config = null)
+    public static async System.Threading.Tasks.Task<bool> ValidatePacketAsync(this Protocol.ProtocolPacket packet,
+                                                                              ProtocolConfiguration config = null)
     {
         config ??= new ProtocolConfiguration();
         byte[] serializedData = config.DataSerializer.Serialize(packet.Data);
         ushort calculatedChecksum = config.ChecksumCalculator.Calculate(serializedData);
-        return calculatedChecksum == packet.Checksum;
+        return calculatedChecksum == (ushort)packet.Checksum;
     }
 }
-

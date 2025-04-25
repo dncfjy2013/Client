@@ -1,7 +1,9 @@
 ﻿using Client.Common;
 using Client.Common.Log;
 using Client.utils;
+using Google.Protobuf;
 using Microsoft.VisualBasic;
+using Protocol;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -104,7 +106,7 @@ namespace Client
         // 初始化配置（示例）
         ProtocolConfiguration config = new ProtocolConfiguration
         {
-            DataSerializer = new JsonSerializerAdapter(),
+            DataSerializer = new ProtobufSerializerAdapter(),
             ChecksumCalculator = new Crc16Calculator(),
             SupportedVersions = new byte[] { 0x01, 0x02 },
             MaxPacketSize = 2 * 1024 * 1024 // 2MB
@@ -754,86 +756,210 @@ namespace Client
         }
 
         // 修改后的发送方法
-        private async Task SendRawData(CommunicationData data)
+        private async Task<bool> SendRawData(CommunicationData data)
         {
-            var packet = new ProtocolPacket(config)
+            // 检查 _clientSocket 是否为 null 或未连接
+            if (_clientSocket == null || !_clientSocket.Connected)
             {
-                Header = new ProtocolHeader { Version = ProtocolHeader.CurrentVersion },
-                Data = data
-            };
+                logger.LogError("Client socket is null or not connected.");
+                return false;
+            }
 
-            // 使用协议配置中的序列化器和校验和计算
-            byte[] fullPacket = packet.ToBytes();
-            await _clientSocket.SendAsync(fullPacket, SocketFlags.None);
+            // 检查 config 是否为 null
+            if (config == null)
+            {
+                logger.LogError("Protocol configuration is null.");
+                return false;
+            }
+
+            try
+            {
+                // 创建协议数据包
+                var packet = CreateProtocolPacket(data);
+
+                // 序列化为字节数组
+                byte[] protocolBytes = SerializePacket(packet);
+                if (protocolBytes == null)
+                {
+                    return false;
+                }
+
+                // 发送数据(确保发送完整)
+                bool sendSuccess = await SendDataBytes(protocolBytes);
+                return sendSuccess;
+            }
+            catch (SocketException sex)
+            {
+                logger.LogError($"Socket error in SendData: {sex.SocketErrorCode} - {sex.Message}");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Unexpected error in SendData: {ex.Message}");
+                return false;
+            }
         }
 
+        private ProtocolPacketWrapper CreateProtocolPacket(CommunicationData data)
+        {
+            return new ProtocolPacketWrapper(
+                new Protocol.ProtocolPacket()
+                {
+                    Header = new Protocol.ProtocolHeader { Version = 0x01, Reserved = ByteString.CopyFrom(new byte[3]) },
+                    Data = data
+                },
+                config);
+        }
+
+        private byte[] SerializePacket(ProtocolPacketWrapper packet)
+        {
+            try
+            {
+                return packet.ToBytes();
+            }
+            catch (Exception ex)
+            {
+                logger.LogError($"Packet serialization failed: {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task<bool> SendDataBytes(byte[] protocolBytes)
+        {
+            int totalSent = 0;
+            while (totalSent < protocolBytes.Length)
+            {
+                int sent = await _clientSocket.SendAsync(
+                    new ArraySegment<byte>(protocolBytes, totalSent, protocolBytes.Length - totalSent),
+                    SocketFlags.None);
+
+                if (sent == 0)
+                {
+                    logger.LogWarning("Connection closed during send");
+                    return false;
+                }
+
+                totalSent += sent;
+                logger.LogDebug($"Sent {sent} bytes, total sent: {totalSent}");
+            }
+
+            logger.LogInformation($"Data sent successfully, total length: {protocolBytes.Length}");
+            return true;
+        }
         // 修改 ReceiveData 方法
         public async Task<CommunicationData> ReceiveData(CancellationToken token)
         {
             var ack = await Task.Run(() => ReceiveRawData(token));
-            return ack;
+            if (ack.Error != null)
+            {
+                logger.LogWarning($"Receive failed: {ack.Error}");
+            }
+            return ack.Data;
         }
         // 优化后的接收方法
-        private async Task<CommunicationData> ReceiveRawData(CancellationToken token)
+        private async Task<(CommunicationData Data, string Error)> ReceiveRawData(CancellationToken token)
         {
+            // 检查 _clientSocket 是否为 null 或未连接
+            if (_clientSocket == null || !_clientSocket.Connected)
+            {
+                Disconnect();
+                return (null, "Client socket is null or not connected.");
+            }
+
+            // 检查 config 是否为 null
+            if (config == null)
+            {
+                return (null, "Protocol configuration is null.");
+            }
+
             try
             {
-                // 第一阶段：读取协议头（8字节）
+                // 1. 读取协议头（8字节）
                 byte[] headerBuffer = new byte[8];
                 int headerOffset = 0;
-                while (headerOffset < headerBuffer.Length)
+                while (headerOffset < headerBuffer.Length && !token.IsCancellationRequested)
                 {
-                    int n = await _clientSocket.ReceiveAsync(
+                    int received = await _clientSocket.ReceiveAsync(
                         new ArraySegment<byte>(headerBuffer, headerOffset, headerBuffer.Length - headerOffset),
                         SocketFlags.None,
                         token);
 
-                    if (n == 0) return null; // 连接正常关闭
-                    headerOffset += n;
+                    if (received == 0)
+                    {
+                        return (null, "Connection closed by remote host");
+                    }
+                    headerOffset += received;
                 }
 
-                // 解析协议头并进行版本检查
-                if (!ProtocolHeader.TryFromBytes(headerBuffer, out ProtocolHeader header) ||
-                    !config.SupportedVersions.Contains(header.Version))
+                // 2. 解析协议头
+                if (!ProtocolHeaderExtensions.TryFromBytes(headerBuffer, out ProtocolHeader header))
                 {
-                    logger.LogWarning("Invalid protocol header or unsupported version");
-                    return null;
+                    return (null, "Invalid protocol header format");
                 }
 
-                // 第二阶段：读取消息体（含校验和）
-                byte[] payloadBuffer = new byte[header.MessageLength];
-                int payloadOffset = 0;
-                while (payloadOffset < header.MessageLength)
+                // 3. 版本检查
+                if (!config.SupportedVersions.Contains((byte)header.Version))
                 {
-                    int n = await _clientSocket.ReceiveAsync(
-                        new ArraySegment<byte>(payloadBuffer, payloadOffset, header.MessageLength - payloadOffset),
+                    return (null, $"Unsupported protocol version: {header.Version}");
+                }
+
+                // 4. 验证消息长度
+                if (header.MessageLength > config.MaxPacketSize - 8) // 减去头部长度
+                {
+                    return (null, $"Message length {header.MessageLength} exceeds maximum allowed size");
+                }
+
+                // 5. 读取消息体
+                byte[] fullPacket = new byte[8 + (int)header.MessageLength];
+                Buffer.BlockCopy(headerBuffer, 0, fullPacket, 0, 8);
+
+                int payloadOffset = 8;
+                int remaining = (int)header.MessageLength;
+                while (remaining > 0 && !token.IsCancellationRequested)
+                {
+                    int received = await _clientSocket.ReceiveAsync(
+                        new ArraySegment<byte>(fullPacket, payloadOffset, remaining),
                         SocketFlags.None,
                         token);
 
-                    if (n == 0) return null; // 连接正常关闭
-                    payloadOffset += n;
+                    if (received == 0)
+                    {
+                        return (null, "Connection closed during payload receive");
+                    }
+
+                    payloadOffset += received;
+                    remaining -= received;
                 }
 
-                // 合并完整数据包并进行完整校验
-                byte[] fullPacket = headerBuffer.Concat(payloadBuffer).ToArray();
-                var parseResult = await ProtocolPacket.TryFromBytesAsync(fullPacket, config);
+                // 6. 解析完整数据包
+                var parseResult = ProtocolPacketWrapper.TryFromBytes(fullPacket, config);
+                if (!parseResult.Success)
+                {
+                    return (null, parseResult.Error ?? "Failed to parse protocol packet");
+                }
 
-                return parseResult.Success ? parseResult.Packet.Data : null;
+                // 7. 返回成功结果
+                return (parseResult.Packet.Data, null);
             }
             catch (OperationCanceledException)
             {
-                logger.LogWarning("Receive operation timed out");
+                return (null, "Receive operation was canceled");
             }
-            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+            catch (SocketException ex)
             {
-                logger.LogCritical($"Connection reset by server: {ex.Message}");
-                Disconnect();
+                switch (ex.SocketErrorCode)
+                {
+                    case SocketError.ConnectionReset:
+                        Disconnect();
+                        return (null, $"Connection reset: {ex.SocketErrorCode}");
+                    default:
+                        return (null, $"Socket error: {ex.SocketErrorCode} - {ex.Message}");
+                }
             }
             catch (Exception ex)
             {
-                logger.LogWarning($"Receive error: {ex.Message}");
+                return (null, $"Receive error: {ex.Message}");
             }
-            return null;
         }
         // 新增异常处理统一方法
         private void HandleSendFailure(Exception ex, CommunicationData data)
@@ -964,8 +1090,8 @@ namespace Client
                 FileSize = session.FileSize,
                 ChunkIndex = chunkIndex,
                 TotalChunks = session.TotalChunks,
-                ChunkData = buffer,
-                ChunkMD5 = chunkMd5,
+                ChunkData = ByteString.CopyFrom(buffer), // Fix: Convert byte[] to ByteString
+                ChunkMd5 = chunkMd5,
                 Priority = session.Priority
             };
 
@@ -987,7 +1113,7 @@ namespace Client
                 InfoType = InfoType.File,
                 FileId = session.FileId,
                 Message = "FILE_COMPLETE",
-                MD5Hash = session.FileHash,
+                Md5Hash = session.FileHash,
                 Priority = DataPriority.High // 完成通知用高优先级
             };
 
