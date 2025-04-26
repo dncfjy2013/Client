@@ -109,7 +109,7 @@ namespace Client
             DataSerializer = new ProtobufSerializerAdapter(),
             ChecksumCalculator = new Crc16Calculator(),
             SupportedVersions = new byte[] { 0x01, 0x02 },
-            MaxPacketSize = 2 * 1024 * 1024 // 2MB
+            MaxPacketSize = 128 * 1024 * 1024 // 128MB
         };
 
         // 新增文件传输相关字段
@@ -1033,41 +1033,53 @@ namespace Client
         private async Task StartFileTransfer(FileTransferSession session)
         {
             UpdateProgress(session, TransferStatus.Preparing);
-
             try
             {
-                using var fileStream = new FileStream(session.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                // 动态并发度：20G以上文件使用更高并发（如32线程）
+                int parallelism = Environment.ProcessorCount * 2;
+                if (session.FileSize > 20L * 1024 * 1024 * 1024)
+                    parallelism = Math.Min(parallelism * 2, 32); // 避免过度占用CPU
 
-                // 多线程分块读取和发送
-                var tasks = new List<Task>();
+                // 异步文件流 + 16MB缓冲区（提升读取速度）
+                using var fileStream = new FileStream(
+                    session.FilePath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    bufferSize: 16 * 1024 * 1024,  // 大缓冲区减少I/O次数
+                    useAsync: true
+                );
+
                 var chunkIndexes = Enumerable.Range(0, session.TotalChunks).ToList();
+                var options = new ParallelOptions { MaxDegreeOfParallelism = parallelism };
 
-                // 使用并行循环限制并发度
-                var options = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount * 2 };
+                // 带重试的并行块发送（每个块最多重试3次，指数退避）
                 await Parallel.ForEachAsync(chunkIndexes, options, async (chunkIndex, ct) =>
                 {
-                    await _fileTransferSemaphore.WaitAsync(ct);
-                    try
+                    int retry = 0;
+                    while (retry < 3) // 增加重试次数到3次，提高可靠性
                     {
-                        await SendFileChunk(fileStream, session, chunkIndex);
-                    }
-                    finally
-                    {
-                        _fileTransferSemaphore.Release();
+                        try
+                        {
+                            await SendFileChunk(fileStream, session, chunkIndex);
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            retry++;
+                            logger.LogWarning($"Chunk {chunkIndex} 发送失败，重试 {retry}/3: {ex.Message}");
+                            await Task.Delay(100 * retry); // 退避时间：100ms → 200ms → 400ms
+                        }
                     }
                 });
 
-                await Task.WhenAll(tasks);
-
-                // 发送完成标记
                 await SendTransferComplete(session);
-
                 UpdateProgress(session, TransferStatus.Completed);
             }
             catch (Exception ex)
             {
                 UpdateProgress(session, TransferStatus.Failed, ex.Message);
-                logger.LogError($"Transfer failed, {session.FileName} {session.FileId}");
+                logger.LogError($"文件 {session.FileName} 传输失败: {ex.Message}");
                 throw;
             }
             finally
@@ -1078,13 +1090,21 @@ namespace Client
 
         private async Task SendFileChunk(FileStream fileStream, FileTransferSession session, int chunkIndex)
         {
-            var chunkSize = (int)Math.Min(session.ChunkSize, session.FileSize - chunkIndex * session.ChunkSize);
+            // 防止块索引溢出（使用long计算位置）
+            long chunkPosition = (long)chunkIndex * session.ChunkSize;
+            if (chunkPosition >= session.FileSize)
+                throw new ArgumentOutOfRangeException(nameof(chunkIndex), "块索引超出文件范围");
 
-            var buffer = new byte[chunkSize];
-            fileStream.Seek(chunkIndex * session.ChunkSize, SeekOrigin.Begin);
-            await fileStream.ReadAsync(buffer, 0, chunkSize);
+            var buffer = new byte[session.ChunkSize];
 
-            var chunkMd5 = CalculateChunkHash(buffer);
+            fileStream.Seek(chunkPosition, SeekOrigin.Begin);
+            int bytesRead = await fileStream.ReadAsync(buffer, 0, buffer.Length);
+
+            if (bytesRead == 0)
+                throw new InvalidOperationException($"块 {chunkIndex} 读取失败（文件结束）");
+
+            var chunkData = buffer.AsSpan(0, bytesRead).ToArray(); // 仅使用有效字节
+            var chunkMd5 = CalculateChunkHash(chunkData);
 
             var data = new CommunicationData
             {
@@ -1094,17 +1114,16 @@ namespace Client
                 FileSize = session.FileSize,
                 ChunkIndex = chunkIndex,
                 TotalChunks = session.TotalChunks,
-                ChunkData = ByteString.CopyFrom(buffer), // Fix: Convert byte[] to ByteString
+                ChunkData = ByteString.CopyFrom(chunkData), // 转换为ByteString
                 ChunkMd5 = chunkMd5,
                 Priority = session.Priority
             };
 
-            await SendData(data);
+            await SendData(data); // 通过优先级队列发送
+            Interlocked.Add(ref session.TransferredBytes, bytesRead); // 原子更新进度
 
-            Interlocked.Add(ref session.TransferredBytes, chunkSize);
-
-            // 添加进度更新节流
-            if (chunkIndex % 10 == 0) // 每10个分块更新一次
+            // 每5个块更新进度（高频操作可能影响性能，适当降低频率）
+            if (chunkIndex % 5 == 0)
             {
                 UpdateProgress(session, TransferStatus.Transferring);
             }

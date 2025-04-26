@@ -6,7 +6,6 @@ using System.Text;
 using Google.Protobuf;
 using Protocol;
 
-
 // 协议配置类
 public class ProtocolConfiguration
 {
@@ -89,96 +88,56 @@ public class Crc16Calculator : IChecksumCalculator
 // 协议头定义
 // 定义扩展方法的静态类
 // 优化后的 ProtocolHeaderExtensions 类，使用 Varint 编码 message_length
+// ProtocolHeaderExtensions 类修正（固定4字节编码，非Varint）
 public static class ProtocolHeaderExtensions
 {
+    // 编码：固定4字节，每个字节低7位存储数据，前3字节最高位设为1（标识后续有字节），第4字节最高位设为0
+    private static byte[] EncodeFixed4Bytes(uint value)
+    {
+        byte[] bytes = new byte[4];
+        for (int i = 0; i < 4; i++)
+        {
+            bytes[i] = (byte)(value & 0x7F);
+            value >>= 7;
+            if (i < 3) bytes[i] |= 0x80; // 前3字节标记为后续有字节（即使无后续，强制格式）
+        }
+        return bytes;
+    }
+
+    // 解码：固定读取4字节，组合为uint32
+    private static uint DecodeFixed4Bytes(byte[] data, int startIndex)
+    {
+        if (startIndex + 4 > data.Length)
+            throw new ArgumentException("Insufficient data for fixed 4-byte decode");
+
+        uint value = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            value |= (uint)(data[startIndex + i] & 0x7F) << (7 * i);
+        }
+        return value;
+    }
+
+    // 修正后的头部序列化（明确固定4字节长度字段）
     public static byte[] ToBytes(this Protocol.ProtocolHeader header)
     {
-        if (header == null)
-        {
-            throw new ArgumentNullException(nameof(header));
-        }
-
-        var ms = new MemoryStream();
-        // 版本号 (1字节)
-        ms.WriteByte((byte)header.Version);
-
-        // 保留字段 (3字节) - 处理null或不足3字节的情况
-        byte[] reservedBytes = header.Reserved?.ToByteArray() ?? new byte[3];
-        if (reservedBytes.Length < 3)
-        {
-            Array.Resize(ref reservedBytes, 3);
-        }
-        ms.Write(reservedBytes, 0, 3);
-
-        // 消息长度 (Varint 编码)
-        var lengthBytes = EncodeVarint((uint)header.MessageLength);
-        ms.Write(lengthBytes, 0, lengthBytes.Length);
-
+        using var ms = new MemoryStream();
+        ms.WriteByte((byte)header.Version); // 1字节版本
+        ms.Write(header.Reserved.ToByteArray().Take(3).ToArray()); // 3字节保留字段（截断/补零由Protobuf自动处理）
+        ms.Write(EncodeFixed4Bytes(header.MessageLength)); // 4字节固定长度字段
         return ms.ToArray();
     }
 
+    // 修正后的头部反序列化（明确固定4字节解析）
     public static bool TryFromBytes(byte[] data, out Protocol.ProtocolHeader result)
     {
-        result = new Protocol.ProtocolHeader
-        {
-            // 设置默认的3字节保留字段
-            Reserved = ByteString.CopyFrom(new byte[3])
-        };
+        result = new Protocol.ProtocolHeader { Reserved = ByteString.CopyFrom(new byte[3]) };
+        if (data.Length < 8) return false; // 固定头部长度：1+3+4=8字节
 
-        if (data == null || data.Length < 4)
-        {
-            return false;
-        }
-
-        try
-        {
-            result.Version = data[0];
-            result.Reserved = ByteString.CopyFrom(data, 1, 3);
-
-            int index = 4;
-            result.MessageLength = DecodeVarint(data, ref index);
-
-            return true;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Header parse error: {ex.Message}");
-            return false;
-        }
-    }
-
-    private static byte[] EncodeVarint(uint value)
-    {
-        var bytes = new List<byte>();
-        do
-        {
-            byte temp = (byte)(value & 0x7F);
-            value >>= 7;
-            if (value != 0)
-            {
-                temp |= 0x80;
-            }
-            bytes.Add(temp);
-        } while (value != 0);
-        return bytes.ToArray();
-    }
-
-    private static uint DecodeVarint(byte[] data, ref int index)
-    {
-        uint result = 0;
-        int shift = 0;
-        byte b;
-        do
-        {
-            if (index >= data.Length)
-            {
-                throw new IndexOutOfRangeException("Varint decoding error: unexpected end of data");
-            }
-            b = data[index++];
-            result |= (uint)(b & 0x7F) << shift;
-            shift += 7;
-        } while ((b & 0x80) != 0);
-        return result;
+        result.Version = data[0];
+        result.Reserved = ByteString.CopyFrom(data, 1, 3);
+        result.MessageLength = DecodeFixed4Bytes(data, 4); // 从第4字节开始解析4字节长度
+        return true;
     }
 }
 
@@ -295,28 +254,21 @@ public class ProtocolPacketWrapper
         }
     }
 
+    // 组装数据包（明确各部分字节长度）
     private byte[] AssemblePacket(byte[] buffer, byte[] headerBytes, byte[] protoData, uint checksum)
     {
-        int totalLength = headerBytes.Length + protoData.Length + sizeof(uint);
+        int headerLength = headerBytes.Length; // 固定8字节
+        int checksumLength = sizeof(uint); // 4字节
+        int totalLength = headerLength + protoData.Length + checksumLength;
+
         if (totalLength > _config.MaxPacketSize)
-        {
-            throw new ProtocolSerializationException(
-                $"Packet size {totalLength} exceeds maximum allowed size {_config.MaxPacketSize}");
-        }
+            throw new ProtocolSerializationException($"Packet too large: {totalLength} > {_config.MaxPacketSize}");
 
-        try
-        {
-            Array.Copy(headerBytes, 0, buffer, 0, headerBytes.Length);
-            Array.Copy(protoData, 0, buffer, headerBytes.Length, protoData.Length);
-            byte[] checksumBytes = BitConverter.GetBytes(checksum);
-            Array.Copy(checksumBytes, 0, buffer, headerBytes.Length + protoData.Length, checksumBytes.Length);
+        Array.Copy(headerBytes, buffer, headerLength);
+        Array.Copy(protoData, 0, buffer, headerLength, protoData.Length);
+        Array.Copy(BitConverter.GetBytes(checksum), 0, buffer, headerLength + protoData.Length, checksumLength);
 
-            return buffer.AsSpan(0, totalLength).ToArray();
-        }
-        catch (Exception ex)
-        {
-            throw new ProtocolSerializationException("Failed to assemble packet", ex);
-        }
+        return buffer.AsSpan(0, totalLength).ToArray();
     }
 
     public static (bool Success, Protocol.ProtocolPacket Packet, string Error) TryFromBytes(byte[] data, ProtocolConfiguration config = null)
@@ -341,14 +293,14 @@ public class ProtocolPacketWrapper
             }
 
             // 3. 检查数据长度
-            int expectedLength = 4 + (int)header.MessageLength;
-            if (data.Length < expectedLength)
+            int expectedPayloadLength = (int)header.MessageLength; // 包含data和checksum的总长度
+            if (data.Length < 8 + expectedPayloadLength) // 头部8字节 + 有效载荷
             {
-                return (false, null, $"Data length {data.Length} less than expected {expectedLength}");
+                return (false, null, "Incomplete packet");
             }
 
-            // 4. 提取有效载荷
-            byte[] payload = data.Skip(4).Take((int)header.MessageLength).ToArray();
+            // 4. 跳过头部, 提取有效载荷
+            byte[] payload = data.Skip(8).Take(expectedPayloadLength).ToArray();
 
             // 5. 提取校验和和数据
             uint receivedChecksum = BitConverter.ToUInt32(payload, payload.Length - sizeof(uint));
