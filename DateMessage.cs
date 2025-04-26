@@ -6,18 +6,7 @@ using System.Text;
 using Google.Protobuf;
 using Protocol;
 
-// 文件传输信息类
-public class FileTransferInfo
-{
-    public string FileId { get; set; }
-    public string FileName { get; set; }
-    public long FileSize { get; set; }
-    public int TotalChunks { get; set; }
-    public int ChunkSize { get; set; }
-    public string FilePath { get; set; }
-    public ConcurrentDictionary<int, byte[]> ReceivedChunks { get; set; }
-}
-// 协议配置类
+
 // 协议配置类
 public class ProtocolConfiguration
 {
@@ -395,29 +384,4 @@ public class ProtocolSerializationException : Exception
 {
     public ProtocolSerializationException(string message) : base(message) { }
     public ProtocolSerializationException(string message, Exception inner) : base(message, inner) { }
-}
-
-// 扩展方法
-public static class ProtocolExtensions
-{
-    public static async System.Threading.Tasks.Task<ProtocolPacketWrapper> CreatePacketAsync(this Protocol.CommunicationData data,
-                                                                                              ProtocolConfiguration config = null)
-    {
-        var packet = new ProtocolPacketWrapper(new Protocol.ProtocolPacket()
-        {
-            Header = new Protocol.ProtocolHeader { Version = 0x01 },
-            Data = data
-        }, config);
-
-        return packet;
-    }
-
-    public static async System.Threading.Tasks.Task<bool> ValidatePacketAsync(this Protocol.ProtocolPacket packet,
-                                                                              ProtocolConfiguration config = null)
-    {
-        config ??= new ProtocolConfiguration();
-        byte[] serializedData = config.DataSerializer.Serialize(packet.Data);
-        ushort calculatedChecksum = config.ChecksumCalculator.Calculate(serializedData);
-        return calculatedChecksum == (ushort)packet.Checksum;
-    }
 }

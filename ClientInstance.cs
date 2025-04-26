@@ -1020,10 +1020,14 @@ namespace Client
 
         private int CalculateChunkSize(long fileSize)
         {
-            // 动态计算块大小，大文件使用更大的块
-            if (fileSize > 10L * 1024 * 1024 * 1024) return 8 * 1024 * 1024;   // 10GB+文件用4MB块
-            if (fileSize > 1L * 1024 * 1024 * 1024) return 4 * 1024 * 1024;    // 1GB+文件用1MB块
-            return 1024 * 1024;  // 小文件用256KB块
+            // 动态分块策略（单位：MB）
+            return fileSize switch
+            {
+                > 20L * 1024 * 1024 * 1024 => 16 * 1024 * 1024,  // 20GB+文件用16MB块
+                > 10L * 1024 * 1024 * 1024 => 8 * 1024 * 1024,   // 10GB+文件用8MB块
+                > 1L * 1024 * 1024 * 1024 => 4 * 1024 * 1024,    // 1GB+文件用4MB块
+                _ => 1 * 1024 * 1024                             // 小文件用1MB块
+            };
         }
 
         private async Task StartFileTransfer(FileTransferSession session)
