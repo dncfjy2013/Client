@@ -1,156 +1,117 @@
-﻿using System;
+﻿using Client;
+using Protocol;
+using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.IO;
-using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
-using Client;
-using Client.Common;
 
-public class StressTester
+public class ThroughputTest
 {
-    private const string ServerIp = "127.0.0.1";
-    private const int Port = 12345;
-    private const int ConcurrentClients = 100;
-    private const int MessagesPerClient = 1000;
-    private const int FileTransferCount = 50;
-    private const string TestFilePath = "test_file.bin";
+    private readonly string _serverIp;
+    private readonly int _serverPort;
+    private readonly int _clientCount; // 并发客户端数量
+    private readonly int _messageCountPerClient; // 每个客户端发送的消息数
+    private readonly DataPriority _testPriority; // 测试数据优先级
 
-    public static async Task Main()
+    public ThroughputTest(string serverIp, int serverPort, int clientCount = 10,
+        int messageCountPerClient = 1000, DataPriority testPriority = DataPriority.Medium)
     {
-        // 生成测试文件
-        File.WriteAllBytes(TestFilePath, new byte[1024 * 1024]); // 1MB文件
-
-        //await RunConnectionStressTest();
-        await RunMessageStormTest();
-        //await RunFileTransferTest();
+        _serverIp = serverIp;
+        _serverPort = serverPort;
+        _clientCount = clientCount;
+        _messageCountPerClient = messageCountPerClient;
+        _testPriority = testPriority;
     }
 
-    private static async Task RunConnectionStressTest()
+    public async Task RunTestAsync()
     {
-        Console.WriteLine("\n=== 连接压力测试 ===");
-        var clients = new ClientInstance[ConcurrentClients];
-        var sw = Stopwatch.StartNew();
+        // 初始化并发统计变量
+        var stopwatch = Stopwatch.StartNew();
+        var sentCount = new ConcurrentDictionary<DataPriority, long>();
+        var receivedAckCount = new ConcurrentDictionary<DataPriority, long>();
+        var latencyList = new ConcurrentBag<long>(); // 记录每条消息的往返延迟
 
-        // 创建并发客户端连接
-        var connectTasks = Enumerable.Range(0, ConcurrentClients)
-            .Select(i => Task.Run(async () =>
-            {
-                var client = new ClientInstance(ServerIp, Port);
-                await client.Connect();
-                clients[i] = client;
-            })).ToArray();
-
-        await Task.WhenAll(connectTasks);
-        sw.Stop();
-
-        Console.WriteLine($"成功建立 {ConcurrentClients} 个连接，耗时 {sw.ElapsedMilliseconds}ms");
-
-        //// 断开所有连接
-        //foreach (var client in clients)
-        //{
-        //    client.Disconnect();
-        //}
-    }
-
-    private static async Task RunMessageStormTest()
-    {
-        Console.WriteLine("\n=== 消息风暴测试 ===");
-        var clients = new ClientInstance[ConcurrentClients];
-        var totalMessages = ConcurrentClients * MessagesPerClient;
-        var successCount = 0;
-        var sw = Stopwatch.StartNew();
-
-        // 初始化客户端
-        for (int i = 0; i < ConcurrentClients; i++)
+        // 注册ACK接收事件以记录延迟
+        Action<int> ackHandler = seqNum =>
         {
-            clients[i] = new ClientInstance(ServerIp, Port);
-            await clients[i].Connect();
-        }
-
-        // 并发发送消息
-        var sendTasks = clients.Select(async client =>
-        {
-            for (int i = 0; i < MessagesPerClient; i++)
+            if (_sentTimestamps.TryRemove(seqNum, out var sendTime))
             {
-                try
-                {
-                    var data = new CommunicationData
-                    {
-                        Message = $"Test message {i}",
-                        InfoType = InfoType.Normal,
-                        Priority = DataPriority.High
-                    };
-                    await client.SendData(data);
-                    Interlocked.Increment(ref successCount);
-                }
-                catch { /* 忽略发送失败 */ }
+                var latency = Stopwatch.GetTimestamp() - sendTime;
+                latencyList.Add(latency);
+                receivedAckCount.AddOrUpdate(_testPriority, 1, (k, v) => v + 1);
             }
-        }).ToArray();
+        };
 
-        await Task.WhenAll(sendTasks);
-        sw.Stop();
-
-        Console.WriteLine($"发送 {totalMessages} 条消息，成功 {successCount} 条");
-        Console.WriteLine($"吞吐量：{totalMessages / sw.Elapsed.TotalSeconds:N0} msg/s");
-
-        // 断开连接
-        foreach (var client in clients)
+        // 客户端工厂方法
+        Func<ClientInstance> createClient = () =>
         {
-            client.Disconnect();
+            var client = new ClientInstance(_serverIp, _serverPort);
+            client.AckReceived += ackHandler; // 绑定ACK处理
+            return client;
+        };
+
+        // 生成测试数据
+        var testMessages = Enumerable.Range(0, _messageCountPerClient)
+            .Select(i => new CommunicationData
+            {
+                InfoType = InfoType.Normal,
+                Message = "TestData-" + i, // 固定消息内容以减少开销
+                Priority = _testPriority,
+                // SeqNum 由客户端自动分配，无需手动设置
+            }).ToList();
+
+        // 并发客户端任务
+        var clientTasks = new List<Task>();
+        for (int c = 0; c < _clientCount; c++)
+        {
+            var client = createClient();
+            await client.Connect(); // 提前连接以避免连接时间影响测试
+            clientTasks.Add(Task.Run(async () => await SendMessages(client, testMessages, sentCount)));
+        }
+
+        // 执行测试
+        await Task.WhenAll(clientTasks);
+        stopwatch.Stop();
+
+        // 输出统计结果
+        Console.WriteLine($"=== 压力测试结果 ===");
+        Console.WriteLine($"测试时间: {stopwatch.ElapsedMilliseconds} ms");
+        Console.WriteLine($"并发客户端数: {_clientCount}");
+        Console.WriteLine($"总发送消息数: {_clientCount * _messageCountPerClient}");
+        Console.WriteLine($"成功接收ACK数: {receivedAckCount[_testPriority]}");
+        Console.WriteLine($"吞吐量: {receivedAckCount[_testPriority] / (stopwatch.ElapsedMilliseconds / 1000.0):F2} 条/秒");
+
+        if (latencyList.Count > 0)
+        {
+            var avgLatency = latencyList.Average() / Stopwatch.Frequency * 1000; // 转换为毫秒
+            Console.WriteLine($"平均延迟: {avgLatency:F2} ms");
+        }
+
+        // 清理资源
+        foreach (var client in clientTasks.Select(t => t.AsyncState as ClientInstance))
+        {
+            client?.Disconnect();
         }
     }
 
-    private static async Task RunFileTransferTest()
+    private ConcurrentDictionary<int, long> _sentTimestamps = new ConcurrentDictionary<int, long>();
+
+    private async Task SendMessages(ClientInstance client, List<CommunicationData> messages,
+        ConcurrentDictionary<DataPriority, long> sentCount)
     {
-        Console.WriteLine("\n=== 文件传输测试 ===");
-        var clients = new ClientInstance[ConcurrentClients];
-        var transferTasks = new Task[ConcurrentClients];
-        var successCount = 0;
-        var sw = Stopwatch.StartNew();
-
-        // 初始化客户端
-        for (int i = 0; i < ConcurrentClients; i++)
+        var tasks = new List<Task>();
+        foreach (var msg in messages)
         {
-            clients[i] = new ClientInstance(ServerIp, Port);
-            await clients[i].Connect();
-        }
-
-        // 并发文件传输
-        var bag = new ConcurrentBag<string>();
-        for (int i = 0; i < FileTransferCount; i++)
-        {
-            var fileId = $"file_{i}";
-            bag.Add(fileId);
-        }
-
-        transferTasks = clients.Select(async client =>
-        {
-            foreach (var fileId in bag.OrderBy(_ => Guid.NewGuid())) // 随机分配文件ID
+            tasks.Add(Task.Run(async () =>
             {
-                try
-                {
-                    //await client.SendFile(TestFilePath, fileId,
-                    //    progress => Console.WriteLine($"进度：{progress}%"));
-                    Interlocked.Increment(ref successCount);
-                }
-                catch { /* 忽略传输失败 */ }
-            }
-        }).ToArray();
-
-        await Task.WhenAll(transferTasks);
-        sw.Stop();
-
-        Console.WriteLine($"完成 {FileTransferCount} 个文件传输，成功 {successCount} 个");
-        Console.WriteLine($"平均耗时：{sw.ElapsedMilliseconds / FileTransferCount}ms");
-
-        // 清理测试文件
-        File.Delete(TestFilePath);
-
-        // 断开连接
-        foreach (var client in clients)
-        {
-            client.Disconnect();
+                // 记录发送时间戳（基于Stopwatch的高精度时钟）
+                var sendTime = Stopwatch.GetTimestamp();
+                await client.SendData(msg);
+                _sentTimestamps.TryAdd(msg.SeqNum, sendTime); // 关联序列号和发送时间
+                sentCount.AddOrUpdate(msg.Priority, 1, (k, v) => v + 1);
+            }));
         }
+        await Task.WhenAll(tasks);
     }
 }

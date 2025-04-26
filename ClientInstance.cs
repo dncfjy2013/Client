@@ -102,7 +102,7 @@ namespace Client
         private readonly object _processedMediumLock = new();
         private readonly object _processedLowLock = new();
         // ACK接收事件
-        private event Action<int> AckReceived;
+        public event Action<int> AckReceived;
         // 初始化配置（示例）
         ProtocolConfiguration config = new ProtocolConfiguration
         {

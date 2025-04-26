@@ -1,231 +1,124 @@
 ﻿using System;
-using System.Diagnostics;
 using System.IO;
-using System.Linq;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
-using System.Collections.Concurrent;
-using Client;
 
-public class MassiveFileStressTester
+namespace Client.Test
 {
-    private const int ParallelClients = 10;          // 并发客户端数量
-    private const int FileSizeGB = 5;               // 单个文件大小（GB）
-    private const int MaxRetries = 3;                // 最大重试次数
-    private const int ProgressIntervalSec = 5;       // 进度报告间隔
-    private const int MemorySamplingIntervalMs = 500;// 内存采样间隔
-
-    private readonly string _serverIp;
-    private readonly int _port;
-    private readonly ConcurrentBag<TestResult> _results = new();
-    private readonly MemoryMonitor _memoryMonitor = new();
-
-    public MassiveFileStressTester(string serverIp, int port)
+    public class LargeFileTransferTest
     {
-        _serverIp = serverIp;
-        _port = port;
-    }
+        private const string ServerIp = "127.0.0.1"; // 替换为实际服务器IP
+        private const int ServerPort = 12345; // 服务器监听端口
+        private const string TestFileDir = @"D:\LargeFileTest\"; // 测试文件目录
+        private const string TestFileName = "TestFile_25GB.dat"; // 测试文件名
+        private const long TestFileSize = 25L * 1024 * 1024 * 1024; // 25GB
 
-    public async Task RunTestAsync()
-    {
-        // 启动内存监控
-        _memoryMonitor.Start(MemorySamplingIntervalMs);
-
-        // 创建虚拟文件目录
-        using var tempDir = new TempDirectory();
-        var testFile = Path.Combine("C:\\Users\\95272\\AppData\\Local\\Temp\\dafe722a-6ec1-4405-b8a4-96b41efd89f6", $"test_{FileSizeGB}GB.dat");
-        //GenerateVirtualFile(testFile, FileSizeGB);
-
-        // 启动并行测试
-        var tasks = Enumerable.Range(0, ParallelClients)
-            .Select(i => Task.Run(() => TestClient(i, testFile)))
-            .ToArray();
-
-        // 启动进度监控
-        var monitorTask = ProgressReporter();
-
-        await Task.WhenAll(tasks);
-        await monitorTask;
-
-        GenerateReport();
-    }
-
-    private async Task TestClient(int clientId, string filePath)
-    {
-        var result = new TestResult { ClientId = clientId };
-        var stopwatch = Stopwatch.StartNew();
-
-        try
+        public async Task RunTest()
         {
-            var client = new ClientInstance(_serverIp, _port);
-            client.OnFileTransferProgress += progress =>
-                UpdateProgress(clientId, progress, result);
+            // 1. 初始化客户端并连接
+            var client = new ClientInstance(ServerIp, ServerPort);
+            client.OnFileTransferProgress += HandleTransferProgress;
 
-            // 连接并上传
-            await client.Connect();
-            await AttemptTransferWithRetry(client, filePath, MaxRetries, result);
-
-            result.Success = true;
-        }
-        catch (Exception ex)
-        {
-            result.Error = ex.Message;
-        }
-        finally
-        {
-            stopwatch.Stop();
-            result.Duration = stopwatch.Elapsed;
-            _results.Add(result);
-        }
-    }
-
-    #region 核心逻辑
-    private void GenerateVirtualFile(string path, int sizeGB)
-    {
-        Console.WriteLine($"Generating {sizeGB}GB test file...");
-        using var fs = File.Create(path);
-        var buffer = new byte[1024 * 1024]; // 1MB buffer
-        var random = new Random();
-
-        for (long i = 0; i < sizeGB * 1024L; i++) // 1GB = 1024MB
-        {
-            random.NextBytes(buffer);
-            fs.Write(buffer, 0, buffer.Length);
-        }
-    }
-
-    private async Task AttemptTransferWithRetry(ClientInstance client,
-        string filePath, int retriesLeft, TestResult result)
-    {
-        try
-        {
-            await client.UploadFileAsync(filePath, DataPriority.High);
-        }
-        catch (Exception ex) when (retriesLeft > 0)
-        {
-            result.RetryCount++;
-            await Task.Delay(CalculateRetryDelay(retriesLeft));
-            await AttemptTransferWithRetry(client, filePath, retriesLeft - 1, result);
-        }
-    }
-    #endregion
-
-    #region 辅助方法
-    private void UpdateProgress(int clientId, FileTransferProgress progress, TestResult result)
-    {
-        result.TotalBytes = progress.TotalBytes;
-        result.TransferredBytes = progress.TransferredBytes;
-    }
-
-    private async Task ProgressReporter()
-    {
-        while (!_results.All(r => r.IsCompleted))
-        {
-            await Task.Delay(ProgressIntervalSec * 1000);
-
-            var active = _results.Count(r => !r.IsCompleted);
-            var completed = _results.Count(r => r.Success);
-            var failed = _results.Count(r => r.IsCompleted && !r.Success);
-
-            Console.WriteLine($"[Progress] Active: {active} | " +
-                            $"Completed: {completed} | Failed: {failed} | " +
-                            $"Memory: {_memoryMonitor.PeakMemoryMB}MB (Current: {_memoryMonitor.CurrentMemoryMB}MB)");
-        }
-    }
-
-    private TimeSpan CalculateRetryDelay(int remainingRetries)
-    {
-        return TimeSpan.FromSeconds(Math.Pow(2, MaxRetries - remainingRetries));
-    }
-
-    private void GenerateReport()
-    {
-        var successful = _results.Where(r => r.Success).ToList();
-        var avgThroughput = successful.Average(r =>
-            r.TotalBytes / 1024.0 / 1024 / r.Duration.TotalSeconds);
-
-        Console.WriteLine($@"
-=== 压力测试报告 ===
-测试规模:
-    客户端数量:    {ParallelClients}
-    单文件大小:    {FileSizeGB}GB
-    总数据量:      {ParallelClients * FileSizeGB}GB
-
-传输结果:
-    成功率:        {successful.Count}/{ParallelClients} ({(successful.Count * 100.0 / ParallelClients):F1}%)
-    平均吞吐量:    {avgThroughput:F2} MB/s
-    最高吞吐量:    {successful.Max(r => r.TotalBytes / 1024.0 / 1024 / r.Duration.TotalSeconds):F2} MB/s
-    平均重试次数:  {successful.Average(r => r.RetryCount):F1}
-
-资源使用:
-    峰值内存:      {_memoryMonitor.PeakMemoryMB} MB
-    平均CPU:       {_memoryMonitor.AverageCpuUsage:F1}%
-");
-    }
-    #endregion
-}
-
-#region 辅助类
-public class TestResult
-{
-    public int ClientId { get; set; }
-    public bool Success { get; set; }
-    public TimeSpan Duration { get; set; }
-    public int RetryCount { get; set; }
-    public long TotalBytes { get; set; }
-    public long TransferredBytes { get; set; }
-    public string Error { get; set; }
-    public bool IsCompleted => Success || !string.IsNullOrEmpty(Error);
-}
-
-public class TempDirectory : IDisposable
-{
-    public string Path { get; }
-
-    public TempDirectory()
-    {
-        Path = System.IO.Path.Combine(
-            System.IO.Path.GetTempPath(),
-            Guid.NewGuid().ToString()
-        );
-        Directory.CreateDirectory(Path);
-    }
-
-    public void Dispose()
-    {
-        Directory.Delete(Path, true);
-    }
-}
-
-public class MemoryMonitor
-{
-    private readonly Process _process = Process.GetCurrentProcess();
-    private long _peakMemory = 0;
-    private double _totalCpu = 0;
-    private int _sampleCount = 0;
-
-    public long CurrentMemoryMB => _process.PrivateMemorySize64 / 1024 / 1024;
-    public long PeakMemoryMB => _peakMemory / 1024 / 1024;
-    public double AverageCpuUsage => _totalCpu / _sampleCount;
-
-    public void Start(int intervalMs)
-    {
-        Task.Run(async () =>
-        {
-            while (true)
+            try
             {
-                var memory = _process.PrivateMemorySize64;
-                if (memory > _peakMemory) _peakMemory = memory;
-
-                var cpuTime = _process.TotalProcessorTime.TotalMilliseconds;
-                await Task.Delay(intervalMs);
-                var cpuDelta = _process.TotalProcessorTime.TotalMilliseconds - cpuTime;
-
-                _totalCpu += cpuDelta / intervalMs * 100;
-                _sampleCount++;
+                await client.Connect();
+                await RunFileTransferTest(client);
             }
-        });
+            finally
+            {
+                client.Dispose();
+            }
+        }
+
+        private async Task RunFileTransferTest(ClientInstance client)
+        {
+            // 2. 准备测试文件（若不存在则生成）
+            PrepareTestFile();
+
+            // 3. 执行文件传输
+            var uploadTask = client.UploadFileAsync(Path.Combine(TestFileDir, TestFileName));
+            await uploadTask; // 等待传输完成（或通过进度回调判断）
+
+            // 4. 验证服务器端文件完整性
+            await VerifyFileIntegrityOnServer();
+        }
+
+        private void PrepareTestFile()
+        {
+            if (!Directory.Exists(TestFileDir))
+                Directory.CreateDirectory(TestFileDir);
+
+            var filePath = Path.Combine(TestFileDir, TestFileName);
+            if (!File.Exists(filePath))
+            {
+                using var fs = File.Create(filePath);
+                fs.SetLength(TestFileSize); // 创建指定大小的空文件（或使用实际大文件）
+            }
+        }
+
+        private async Task VerifyFileIntegrityOnServer()
+        {
+            // 假设服务器接收路径为 "ServerReceived/"
+            var serverFilePath = Path.Combine("ServerReceived", TestFileName);
+            if (!File.Exists(serverFilePath))
+                throw new Exception("服务器端文件未找到");
+
+            // 验证文件大小
+            var serverFileSize = new FileInfo(serverFilePath).Length;
+            if (serverFileSize != TestFileSize)
+                throw new Exception($"文件大小不一致：客户端{TestFileSize} vs 服务器{serverFileSize}");
+
+            // 验证MD5哈希
+            var clientHash = await CalculateMD5(Path.Combine(TestFileDir, TestFileName));
+            var serverHash = await CalculateMD5(serverFilePath);
+            if (clientHash != serverHash)
+                throw new Exception("文件MD5哈希不一致");
+
+            Console.WriteLine("文件传输验证通过：大小和MD5均一致");
+        }
+
+        private async Task<string> CalculateMD5(string filePath)
+        {
+            using var md5 = MD5.Create();
+            using var stream = File.OpenRead(filePath);
+            var hashBytes = await md5.ComputeHashAsync(stream);
+            return BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
+        }
+
+        private void HandleTransferProgress(Client.FileTransferProgress progress)
+        {
+            switch (progress.Status)
+            {
+                case (Client.TransferStatus)TransferStatus.Preparing:
+                    Console.WriteLine($"[准备] {progress.FileName} - {progress.TotalBytes / (1024d * 1024 * 1024):F2} GB");
+                    break;
+
+                case (Client.TransferStatus)TransferStatus.Transferring:
+                    var progressPct = (double)progress.TransferredBytes / progress.TotalBytes * 100;
+                    Console.WriteLine($"[进行中] {progress.FileName}: {progressPct:F2}% 已传输");
+                    break;
+
+                case (Client.TransferStatus)TransferStatus.Completed:
+                    Console.WriteLine($"[完成] {progress.FileName} - 传输成功");
+                    break;
+
+                case (Client.TransferStatus)TransferStatus.Failed:
+                    throw new Exception($"传输失败：{progress.FileName}");
+            }
+        }
+
+        public enum TransferStatus
+        {
+            Preparing,
+            Transferring,
+            Completed,
+            Failed
+        }
+
+        public static void Main()
+        {
+            var test = new LargeFileTransferTest();
+            test.RunTest().GetAwaiter().GetResult();
+        }
     }
 }
-#endregion
-
-// 使用示例
