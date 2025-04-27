@@ -55,7 +55,7 @@ public class ThroughputTest
         var testMessages = Enumerable.Range(0, _messageCountPerClient)
             .Select(i => new CommunicationData
             {
-                InfoType = InfoType.Normal,
+                InfoType = InfoType.CtsNormal,
                 Message = "TestData-" + i, // 固定消息内容以减少开销
                 Priority = _testPriority,
                 // SeqNum 由客户端自动分配，无需手动设置

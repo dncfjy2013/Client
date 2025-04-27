@@ -519,7 +519,7 @@ namespace Client
                 {
                     var ack = new CommunicationData
                     {
-                        InfoType = InfoType.Ack,
+                        InfoType = data.InfoType,
                         AckNum = data.SeqNum,
                         Priority = DataPriority.High // ACK使用高优先级
                     };
@@ -1108,7 +1108,7 @@ namespace Client
 
             var data = new CommunicationData
             {
-                InfoType = InfoType.File,
+                InfoType = InfoType.CtsFile,
                 FileId = session.FileId,
                 FileName = session.FileName,
                 FileSize = session.FileSize,
@@ -1133,7 +1133,7 @@ namespace Client
         {
             var completeData = new CommunicationData
             {
-                InfoType = InfoType.File,
+                InfoType = InfoType.CtsFile,
                 FileId = session.FileId,
                 Message = "FILE_COMPLETE",
                 Md5Hash = session.FileHash,
