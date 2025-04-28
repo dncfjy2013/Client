@@ -27,16 +27,18 @@ message CommunicationData {
   int32 seq_num = 3;
   int32 ack_num = 4;
   DataPriority priority = 5;
-  
+  int32 sourceid = 6;
+  int32 targetid = 7;
+
   // File transfer fields
-  string file_id = 6;
-  string file_name = 7;
-  int64 file_size = 8;
-  int32 chunk_index = 9;
-  int32 total_chunks = 10;
-  bytes chunk_data = 11;
-  string md5_hash = 12;
-  string chunk_md5 = 13;
+  string file_id = 8;
+  string file_name = 9;
+  int64 file_size = 10;
+  int32 chunk_index = 11;
+  int32 total_chunks = 12;
+  bytes chunk_data = 13;
+  string md5_hash = 14;
+  string chunk_md5 = 15;
 }
 
 message ProtocolHeader {
