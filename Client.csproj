@@ -17,7 +17,12 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Protobuf Include="Date.proto" GrpcServices="Client" />
+    <Protobuf Include="Core\Protocal\Date.proto" GrpcServices="Client" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Folder Include="Common\" />
+    <Folder Include="utils\" />
   </ItemGroup>
 
 </Project>

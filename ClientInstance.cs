@@ -1,6 +1,4 @@
-﻿using Client.Common;
-using Client.Common.Log;
-using Client.utils;
+﻿using Client.Logger;
 using Google.Protobuf;
 using Microsoft.VisualBasic;
 using Protocol;
@@ -24,9 +22,7 @@ namespace Client
         private readonly int _port;
         private Socket _clientSocket;
         private bool _isConnected = false;
-        private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
-
-        private readonly Logger logger = new Logger();
+        private readonly LoggerInstance logger = new LoggerInstance();
         private int _heartbeatCountout;
 
         // 初始化信号量（在构造函数中）

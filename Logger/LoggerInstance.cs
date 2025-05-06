@@ -1,70 +1,24 @@
-﻿using System;
+﻿#define DISABLE_TRACE_LOGGING 
+#define DISABLE_DEBUG_LOGGING 
+//#define DISABLE_INFORMATION_LOGGING 
+
+using Client.Logger.Common;
 using System.Collections.Concurrent;
-using System.IO;
-using System.Threading;
-using System.Threading.Tasks;
 
-namespace Client.utils
+namespace Client.Logger
 {
-    #region Level
-    public enum LogLevel
+    public class LoggerInstance : AbstractLogger, ILogger
     {
-        Trace = 0,
-        Debug = 1,
-        Information = 2,
-        Warning = 3,
-        Error = 4,
-        Critical = 5,
-        None = 6
-    }
-    #endregion
-
-    #region Configuration
-    public class LoggerConfig
-    {
-        public LogLevel ConsoleLogLevel { get; set; } = LogLevel.Trace;
-        public LogLevel FileLogLevel { get; set; } = LogLevel.Information;
-        public string LogFilePath { get; set; } = "application.log";
-        public bool EnableAsyncWriting { get; set; } = true;
-    }
-    #endregion
-
-    #region Log Message Structure
-    public  struct LogMessage
-    {
-        public DateTime Timestamp { get; }
-        public LogLevel Level { get; }
-        public string Message { get; }
-        public int ThreadId { get; }
-        public string ThreadName { get; }
-
-        public LogMessage(DateTime timestamp, LogLevel level, string message,
-            int threadId, string threadName)
-        {
-            Timestamp = timestamp;
-            Level = level;
-            Message = message;
-            ThreadId = threadId;
-            ThreadName = threadName;
-        }
-    }
-    #endregion
-    public class Logger : IDisposable
-    {
-        private static readonly Lazy<Logger> _instance = new Lazy<Logger>(() => new Logger());
-        public static Logger Instance => _instance.Value;
+        private static readonly Lazy<LoggerInstance> _instance = new Lazy<LoggerInstance>(() => new LoggerInstance());
+        public static LoggerInstance Instance => _instance.Value;
 
         private readonly BlockingCollection<LogMessage> _logQueue = new BlockingCollection<LogMessage>(1000);
-        private readonly CancellationTokenSource _cts = new CancellationTokenSource();
-        private readonly LoggerConfig _config;
         private readonly Task _logWriterTask;
 
-        public Logger() : this(new LoggerConfig()) { }
+        public LoggerInstance() : this(new LoggerConfig()) { }
 
-        public Logger(LoggerConfig config)
+        public LoggerInstance(LoggerConfig config) : base(config)
         {
-            _config = config ?? throw new ArgumentNullException(nameof(config));
-
             if (_config.EnableAsyncWriting)
             {
                 _logWriterTask = Task.Factory.StartNew(
@@ -76,12 +30,28 @@ namespace Client.utils
         }
 
         #region Public Logging Methods
-        public void LogTrace(string message) => Log(LogLevel.Trace, message);
-        public void LogDebug(string message) => Log(LogLevel.Debug, message);
-        public void LogInformation(string message) => Log(LogLevel.Information, message);
-        public void LogWarning(string message) => Log(LogLevel.Warning, message);
-        public void LogError(string message) => Log(LogLevel.Error, message);
-        public void LogCritical(string message) => Log(LogLevel.Critical, message);
+
+#if !DISABLE_TRACE_LOGGING
+        public override void LogTrace(string message) => Log(LogLevel.Trace, message);
+#else
+        public override void LogTrace(string message) { }
+#endif
+
+#if !DISABLE_DEBUG_LOGGING
+        public override void LogDebug(string message) => Log(LogLevel.Debug, message);
+#else
+        public override void LogDebug(string message) { }
+#endif
+
+#if !DISABLE_INFORMATION_LOGGING
+        public override void LogInformation(string message) => Log(LogLevel.Information, message);
+#else
+        public override void LogInformation(string message) { }
+#endif
+
+        public override void LogWarning(string message) => Log(LogLevel.Warning, message);
+        public override void LogError(string message) => Log(LogLevel.Error, message);
+        public override void LogCritical(string message) => Log(LogLevel.Critical, message);
 
         private void Log(LogLevel level, string message)
         {
@@ -158,15 +128,30 @@ namespace Client.utils
 
         private void WriteToFile(LogMessage message)
         {
-            try
+            while (true)
             {
-                File.AppendAllText(_config.LogFilePath,
-                    FormatMessage(message, "FILE") + Environment.NewLine);
-            }
-            catch (Exception ex)
-            {
-                // 文件写入失败处理
-                Console.WriteLine($"Failed to write log to file: {ex.Message}");
+                try
+                {
+                    using (FileStream fileStream = new FileStream(_config.LogFilePath, FileMode.Append, FileAccess.Write, FileShare.None))
+                    {
+                        using (StreamWriter writer = new StreamWriter(fileStream))
+                        {
+                            writer.WriteLine(FormatMessage(message, "FILE"));
+                        }
+                    }
+                    break;
+                }
+                catch (IOException ex) when (ex.HResult == -2147024864) // 表示文件被占用
+                {
+                    // 等待一段时间后重试
+                    Thread.Sleep(1000);
+                }
+                catch (Exception ex)
+                {
+                    // 文件写入失败处理
+                    Console.WriteLine($"Failed to write log to file: {ex.Message}");
+                    break;
+                }
             }
         }
         #endregion

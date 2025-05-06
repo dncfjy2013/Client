@@ -3,7 +3,7 @@ using Client.Test;
 
 var test = new ThroughputTest(
             serverIp: "127.0.0.1",
-            serverPort: 12345,
+            serverPort: 1111,
             clientCount: 50, // 50个并发客户端
             messageCountPerClient: 2000 // 每个客户端发送2000条消息
         );
