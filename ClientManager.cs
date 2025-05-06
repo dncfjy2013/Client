@@ -1,4 +1,4 @@
-﻿using Client;
+﻿using Client.Core;
 using Protocol;
 using System;
 using System.Collections.Concurrent;
@@ -44,9 +44,9 @@ public class ThroughputTest
         };
 
         // 客户端工厂方法
-        Func<ClientInstance> createClient = () =>
+        Func<SocketClientInstance> createClient = () =>
         {
-            var client = new ClientInstance(_serverIp, _serverPort);
+            var client = new SocketClientInstance(_serverIp, _serverPort);
             client.AckReceived += ackHandler; // 绑定ACK处理
             return client;
         };
@@ -89,7 +89,7 @@ public class ThroughputTest
         }
 
         // 清理资源
-        foreach (var client in clientTasks.Select(t => t.AsyncState as ClientInstance))
+        foreach (var client in clientTasks.Select(t => t.AsyncState as SocketClientInstance))
         {
             client?.Disconnect();
         }
@@ -97,7 +97,7 @@ public class ThroughputTest
 
     private ConcurrentDictionary<int, long> _sentTimestamps = new ConcurrentDictionary<int, long>();
 
-    private async Task SendMessages(ClientInstance client, List<CommunicationData> messages,
+    private async Task SendMessages(SocketClientInstance client, List<CommunicationData> messages,
         ConcurrentDictionary<DataPriority, long> sentCount)
     {
         var tasks = new List<Task>();

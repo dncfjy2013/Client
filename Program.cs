@@ -1,14 +1,33 @@
 ﻿using Client;
+using Client.Core;
 using Client.Test;
 
-var test = new ThroughputTest(
-            serverIp: "127.0.0.1",
-            serverPort: 1111,
-            clientCount: 50, // 50个并发客户端
-            messageCountPerClient: 2000 // 每个客户端发送2000条消息
-        );
+//var test = new ThroughputTest(
+//            serverIp: "127.0.0.1",
+//            serverPort: 1111,
+//            clientCount: 50, // 50个并发客户端
+//            messageCountPerClient: 2000 // 每个客户端发送2000条消息
+//        );
 
-await test.RunTestAsync();
+//await test.RunTestAsync();
+
+using (var clientInstance = new HttpClientInstance("http://localhost:9999/"))
+{
+    var getParameters = new Dictionary<string, string>
+            {
+                { "param1", "value1" },
+                { "param2", "value2" }
+            };
+    await clientInstance.SendGetRequest(getParameters);
+
+    await clientInstance.SendPostRequest("这是 POST 请求的数据", getParameters);
+
+    await clientInstance.SendPutRequest("这是 PUT 请求的数据", getParameters);
+
+    await clientInstance.SendDeleteRequest(getParameters);
+}
+
+
 //LargeFileTransferTest.Main();
 // 使用示例
 // 执行测试
@@ -24,7 +43,7 @@ await test.RunTestAsync();
 //Console.ReadKey();
 
 
-//var client = new ClientInstance("127.0.0.1", 12345);
+//var client = new SocketClientInstance("127.0.0.1", 12345);
 //await client.Connect();
 //CommunicationData communicationData = new CommunicationData()
 //{

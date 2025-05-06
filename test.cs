@@ -2,6 +2,7 @@
 using System.IO;
 using System.Security.Cryptography;
 using System.Threading.Tasks;
+using Client.Core;
 using Client.Core.Conifg;
 
 namespace Client.Test
@@ -17,7 +18,7 @@ namespace Client.Test
         public async Task RunTest()
         {
             // 1. 初始化客户端并连接
-            var client = new ClientInstance(ServerIp, ServerPort);
+            var client = new SocketClientInstance(ServerIp, ServerPort);
             client.OnFileTransferProgress += HandleTransferProgress;
 
             try
@@ -31,7 +32,7 @@ namespace Client.Test
             }
         }
 
-        private async Task RunFileTransferTest(ClientInstance client)
+        private async Task RunFileTransferTest(SocketClientInstance client)
         {
             // 2. 准备测试文件（若不存在则生成）
             PrepareTestFile();

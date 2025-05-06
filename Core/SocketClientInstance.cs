@@ -1,22 +1,16 @@
-﻿using Client.Logger;
+﻿using Client.Core.Conifg;
+using Client.Logger;
 using Google.Protobuf;
-using Microsoft.VisualBasic;
 using Protocol;
-using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
-using System.Text;
-using System.Text.Json;
-using System.Threading.Tasks;
 
-namespace Client
+namespace Client.Core
 {
-    // ClientInstance.cs - 客户端类
-    public class ClientInstance
+    // SocketClientInstance.cs - 客户端类
+    public class SocketClientInstance
     {
         private readonly string _serverIp;
         private readonly int _port;
@@ -111,7 +105,7 @@ namespace Client
         // 新增文件传输相关字段
         private readonly ConcurrentDictionary<string, FileTransferSession> _fileTransfers = new();
         private readonly SemaphoreSlim _fileTransferSemaphore = new(Environment.ProcessorCount * 2);
-        public ClientInstance(string serverIp, int port)
+        public SocketClientInstance(string serverIp, int port)
         {
             _serverIp = serverIp;
             _port = port;
@@ -181,7 +175,7 @@ namespace Client
                 {
                     logger.LogDebug($"Try Get seqNumber from {priority} PendingMessages Queue failure");
                 }
-                return; 
+                return;
             }
 
             var config = _retryConfigs[priority];
@@ -333,7 +327,7 @@ namespace Client
         {
             lock (_processedHighLock)
             {
-                if(!TryRemovePendingMessage(DataPriority.High, data.SeqNum))
+                if (!TryRemovePendingMessage(DataPriority.High, data.SeqNum))
                 {
                     logger.LogTrace($"PendingMessage HIGH priority Seq={data.SeqNum}");
                 }
@@ -402,7 +396,7 @@ namespace Client
                 // 6. 动态调整窗口大小
                 AdjustWindowSize();
             }
-        
+
         }
         private void ProcessInWindow(CommunicationData data, ref int expected)
         {
@@ -667,7 +661,7 @@ namespace Client
                         case DataPriority.High:
                             // 高优先级动态上限
                             int highDynamicMax = (int)(WindowSize * HighBaseRatio +
-                                (WindowSize * 0.2f * (1 - highUsageFactor)));
+                                WindowSize * 0.2f * (1 - highUsageFactor));
                             logger.LogTrace($"Currrent highDynamicMax: {highDynamicMax}, used {highUsed}");
                             if (highUsed < highDynamicMax && windowRemain > 0)
                             {
@@ -799,9 +793,9 @@ namespace Client
         private ProtocolPacketWrapper CreateProtocolPacket(CommunicationData data)
         {
             return new ProtocolPacketWrapper(
-                new Protocol.ProtocolPacket()
+                new ProtocolPacket()
                 {
-                    Header = new Protocol.ProtocolHeader { Version = 0x01, Reserved = ByteString.CopyFrom(new byte[3]) },
+                    Header = new ProtocolHeader { Version = 0x01, Reserved = ByteString.CopyFrom(new byte[3]) },
                     Data = data
                 },
                 config);
