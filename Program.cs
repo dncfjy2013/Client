@@ -1,6 +1,5 @@
-﻿using Client;
-using Client.Core;
-using Client.Test;
+﻿using Client.Core.UdpClientClass;
+using System.Net;
 
 //var test = new ThroughputTest(
 //            serverIp: "127.0.0.1",
@@ -11,21 +10,55 @@ using Client.Test;
 
 //await test.RunTestAsync();
 
-using (var clientInstance = new HttpClientInstance("http://localhost:9999/"))
+// 配置选项
+var options = new UdpClientOptions
 {
-    var getParameters = new Dictionary<string, string>
-            {
-                { "param1", "value1" },
-                { "param2", "value2" }
-            };
-    await clientInstance.SendGetRequest(getParameters);
+    MaxReconnectAttempts = 3
+};
 
-    await clientInstance.SendPostRequest("这是 POST 请求的数据", getParameters);
+// 创建数据客户端
+using var client = new UdpClientInstance(
+    new RetryTransport(new UdpClientAdapter(), options),
+    new JsonEncoder(),
+    new IPEndPoint(IPAddress.Parse("127.0.0.1"), 3333),
+    options);
 
-    await clientInstance.SendPutRequest("这是 PUT 请求的数据", getParameters);
+// 注册压缩插件
+client.RegisterPlugin(new CompressionPlugin());
 
-    await clientInstance.SendDeleteRequest(getParameters);
-}
+// 发送测试消息
+var sendData = new Date
+{
+    id = 1,
+    message = "Hello UDP"
+};
+
+var sendTask = client.SendMessageAsync<Date>(sendData);
+
+// 接收测试消息
+var receiveTask = client.ReceiveMessageAsync<Date>();
+
+await Task.WhenAll(sendTask, receiveTask);
+
+Console.WriteLine($"接收成功: ID={receiveTask.Result.Message.id}, 内容={receiveTask.Result.Message.message}");
+        
+
+
+//using (var clientInstance = new HttpClientInstance("http://localhost:9999/"))
+//{
+//    var getParameters = new Dictionary<string, string>
+//            {
+//                { "param1", "value1" },
+//                { "param2", "value2" }
+//            };
+//    await clientInstance.SendGetRequest(getParameters);
+
+//    await clientInstance.SendPostRequest("这是 POST 请求的数据", getParameters);
+
+//    await clientInstance.SendPutRequest("这是 PUT 请求的数据", getParameters);
+
+//    await clientInstance.SendDeleteRequest(getParameters);
+//}
 
 
 //LargeFileTransferTest.Main();
