@@ -4,79 +4,20 @@ using System.IO;
 using System.IO.Compression;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Client.Core.UdpClientClass.Config;
+using Client.Core.UdpClientClass.Interface;
 
 namespace Client.Core.UdpClientClass
 {
-    #region 接口定义
-    public interface IUdpTransport
-    {
-        Task<int> SendAsync(byte[] buffer, int bytes, IPEndPoint endpoint);
-        Task<UdpReceiveResult> ReceiveAsync();
-        void Connect(IPEndPoint endpoint);
-        void Close();
-    }
-
-    public interface IMessageEncoder
-    {
-        byte[] Encode<T>(T message);
-        T Decode<T>(byte[] buffer);
-    }
-
-    public interface IUdpPlugin
-    {
-        ValueTask<byte[]> OnSendingAsync(byte[] data, CancellationToken ct);
-        ValueTask<byte[]> OnReceivedAsync(byte[] data, CancellationToken ct);
-    }
-    #endregion
-
-    #region 默认实现
-    internal class UdpClientAdapter : IUdpTransport
-    {
-        private readonly UdpClient _client;
-
-        public UdpClientAdapter() => _client = new UdpClient();
-
-        public Task<int> SendAsync(byte[] buffer, int bytes, IPEndPoint endpoint) =>
-            _client.SendAsync(buffer, bytes, endpoint);
-
-        public Task<UdpReceiveResult> ReceiveAsync() => _client.ReceiveAsync();
-
-        public void Connect(IPEndPoint endpoint) => _client.Connect(endpoint);
-        public void Close() => _client.Close();
-    }
-
-    public class JsonEncoder : IMessageEncoder
-    {
-        public byte[] Encode<T>(T message)
-        {
-            if (message == null)
-                throw new ArgumentNullException(nameof(message));
-            return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message));
-        }
-
-        public T Decode<T>(byte[] buffer)
-        {
-            if (buffer == null || buffer.Length == 0)
-                throw new ArgumentException("接收数据为空");
-
-            var json = Encoding.UTF8.GetString(buffer);
-            try
-            {
-                return JsonSerializer.Deserialize<T>(json);
-            }
-            catch (JsonException ex)
-            {
-                throw new InvalidDataException("无效的JSON格式", ex);
-            }
-        }
-    }
-    #endregion
-
     #region 核心客户端
+    /// <summary>
+    /// UDP客户端实例，包含完整的消息处理管道
+    /// </summary>
     public class UdpClientInstance : IDisposable
     {
         private readonly IUdpTransport _transport;
@@ -103,6 +44,9 @@ namespace Client.Core.UdpClientClass
         }
 
         #region 消息处理管道
+        /// <summary>
+        /// 发送消息处理管道，按顺序执行所有注册的发送插件
+        /// </summary>
         private async Task<byte[]> ProcessSendingPipeline(byte[] rawData, CancellationToken ct)
         {
             var data = rawData;
@@ -113,10 +57,13 @@ namespace Client.Core.UdpClientClass
             return data;
         }
 
+        /// <summary>
+        /// 接收消息处理管道，按逆序执行所有注册的接收插件
+        /// </summary>
         private async Task<byte[]> ProcessReceivingPipeline(byte[] rawData, CancellationToken ct)
         {
             var data = rawData;
-            foreach (var plugin in _plugins)
+            foreach (var plugin in _plugins.AsEnumerable().Reverse())
             {
                 data = await plugin.OnReceivedAsync(data, ct).ConfigureAwait(false);
             }
@@ -125,8 +72,14 @@ namespace Client.Core.UdpClientClass
         #endregion
 
         #region 公共方法
+        /// <summary>
+        /// 注册消息处理插件（插件按注册顺序执行）
+        /// </summary>
         public void RegisterPlugin(IUdpPlugin plugin) => _plugins.Add(plugin);
 
+        /// <summary>
+        /// 异步发送消息（支持取消）
+        /// </summary>
         public async Task<bool> SendMessageAsync<T>(
             T message,
             CancellationToken cancellationToken = default)
@@ -152,6 +105,9 @@ namespace Client.Core.UdpClientClass
             return false;
         }
 
+        /// <summary>
+        /// 异步接收消息（带超时控制）
+        /// </summary>
         public async Task<(T Message, IPEndPoint Sender)> ReceiveMessageAsync<T>(
             CancellationToken cancellationToken = default)
         {
@@ -208,113 +164,6 @@ namespace Client.Core.UdpClientClass
 
         ~UdpClientInstance() => Dispose(false);
         #endregion
-    }
-    #endregion
-
-    #region 扩展配置
-    public class UdpClientOptions
-    {
-        public TimeSpan SendTimeout { get; set; } = TimeSpan.FromSeconds(5);
-        public TimeSpan ReceiveTimeout { get; set; } = TimeSpan.FromSeconds(30);
-        public int MaxReconnectAttempts { get; set; } = 3;
-        public Encoding DefaultEncoding { get; set; } = Encoding.UTF8;
-    }
-    #endregion
-
-    #region 扩展插件示例
-    public class CompressionPlugin : IUdpPlugin
-    {
-        public ValueTask<byte[]> OnSendingAsync(byte[] data, CancellationToken ct)
-        {
-            // 发送端：JSON编码 → 压缩 → Base64编码
-            var compressed = Compress(data);
-            return new ValueTask<byte[]>(compressed);
-        }
-
-        public ValueTask<byte[]> OnReceivedAsync(byte[] data, CancellationToken ct)
-        {
-            // 接收端：Base64解码 → 解压 → 返回原始数据
-            var decompressed = Decompress(data);
-            return new ValueTask<byte[]>(decompressed);
-        }
-
-        private byte[] Compress(byte[] data)
-        {
-            using var ms = new MemoryStream();
-            using (var gs = new GZipStream(ms, CompressionMode.Compress))
-            {
-                gs.Write(data, 0, data.Length);
-            }
-            return ms.ToArray();
-        }
-
-        private byte[] Decompress(byte[] compressed)
-        {
-            using var ms = new MemoryStream(compressed);
-            using var gs = new GZipStream(ms, CompressionMode.Decompress);
-            using var outMs = new MemoryStream();
-            gs.CopyTo(outMs);
-            return outMs.ToArray();
-        }
-    }
-
-    public class RetryTransport : IUdpTransport
-    {
-        private readonly IUdpTransport _innerTransport;
-        private readonly UdpClientOptions _options;
-
-        public RetryTransport(IUdpTransport innerTransport, UdpClientOptions options)
-        {
-            _innerTransport = innerTransport;
-            _options = options;
-        }
-
-        public async Task<int> SendAsync(byte[] buffer, int bytes, IPEndPoint endpoint)
-        {
-            int attempt = 0;
-            while (true)
-            {
-                try
-                {
-                    return await _innerTransport.SendAsync(buffer, bytes, endpoint)
-                        .ConfigureAwait(false);
-                }
-                catch (SocketException ex) when (attempt++ < _options.MaxReconnectAttempts)
-                {
-                    await Task.Delay(_options.SendTimeout).ConfigureAwait(false);
-                }
-            }
-        }
-
-        public Task<UdpReceiveResult> ReceiveAsync()
-        {
-            int attempt = 0;
-            return Task.Run(async () =>
-            {
-                while (true)
-                {
-                    try
-                    {
-                        return await _innerTransport.ReceiveAsync().ConfigureAwait(false);
-                    }
-                    catch (SocketException ex) when (attempt++ < _options.MaxReconnectAttempts)
-                    {
-                        await Task.Delay(_options.ReceiveTimeout).ConfigureAwait(false);
-                    }
-                }
-            });
-        }
-
-        public void Connect(IPEndPoint endpoint) => _innerTransport.Connect(endpoint);
-        public void Close() => _innerTransport.Close();
-    }
-    #endregion
-
-    #region 使用示例
-    public class Date
-    {
-        public string message { get; set; }
-        public int id { get; set; }
     }
     #endregion
 }
