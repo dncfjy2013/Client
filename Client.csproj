@@ -17,7 +17,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Protobuf Include="Core\Protocal\Date.proto" GrpcServices="Client" />
+    <Protobuf Include="Core\SocketClientClass\Protocal\Date.proto" GrpcServices="Client" />
   </ItemGroup>
 
   <ItemGroup>

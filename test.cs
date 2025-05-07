@@ -2,8 +2,8 @@
 using System.IO;
 using System.Security.Cryptography;
 using System.Threading.Tasks;
-using Client.Core;
-using Client.Core.Conifg;
+using Client.Core.SocketClientClass;
+using Client.Core.SocketClientClass.Conifg;
 
 namespace Client.Test
 {
@@ -91,20 +91,20 @@ namespace Client.Test
         {
             switch (progress.Status)
             {
-                case (Core.Conifg.TransferStatus)TransferStatus.Preparing:
+                case (Core.SocketClientClass.Conifg.TransferStatus)TransferStatus.Preparing:
                     Console.WriteLine($"[准备] {progress.FileName} - {progress.TotalBytes / (1024d * 1024 * 1024):F2} GB");
                     break;
 
-                case (Core.Conifg.TransferStatus)TransferStatus.Transferring:
+                case (Core.SocketClientClass.Conifg.TransferStatus)TransferStatus.Transferring:
                     var progressPct = (double)progress.TransferredBytes / progress.TotalBytes * 100;
                     Console.WriteLine($"[进行中] {progress.FileName}: {progressPct:F2}% 已传输");
                     break;
 
-                case (Core.Conifg.TransferStatus)TransferStatus.Completed:
+                case (Core.SocketClientClass.Conifg.TransferStatus)TransferStatus.Completed:
                     Console.WriteLine($"[完成] {progress.FileName} - 传输成功");
                     break;
 
-                case (Core.Conifg.TransferStatus)TransferStatus.Failed:
+                case (Core.SocketClientClass.Conifg.TransferStatus)TransferStatus.Failed:
                     throw new Exception($"传输失败：{progress.FileName}");
             }
         }

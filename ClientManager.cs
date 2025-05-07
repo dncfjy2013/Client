@@ -1,4 +1,4 @@
-﻿using Client.Core;
+﻿using Client.Core.SocketClientClass;
 using Protocol;
 using System;
 using System.Collections.Concurrent;

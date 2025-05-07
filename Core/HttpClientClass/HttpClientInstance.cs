@@ -5,7 +5,7 @@ using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace Client.Core
+namespace Client.Core.HttpClientClass
 {
     public class HttpClientInstance : IDisposable
     {

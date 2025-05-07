@@ -1,4 +1,4 @@
-﻿using Client.Core.Conifg;
+﻿using Client.Core.SocketClientClass.Conifg;
 using Client.Logger;
 using Google.Protobuf;
 using Protocol;
@@ -7,7 +7,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 
-namespace Client.Core
+namespace Client.Core.SocketClientClass
 {
     // SocketClientInstance.cs - 客户端类
     public class SocketClientInstance
