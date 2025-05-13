@@ -1,4 +1,5 @@
-﻿using Client.Core.UdpClientClass;
+﻿using Client.Core.SSLClientClass;
+using Client.Core.UdpClientClass;
 using Client.Core.UdpClientClass.Config;
 using Client.Core.UdpClientClass.DateRetry;
 using Client.Core.UdpClientClass.Encoder;
@@ -9,6 +10,12 @@ using Client.Core.UdpClientClass.Protocal;
 using System.Net;
 using System.Security.Cryptography;
 
+SSLClientInstance sSLClientInstance = new SSLClientInstance(true);
+await sSLClientInstance.ConnectAsync("127.0.0.1", 2222);
+while (true)
+{
+
+}
 //var test = new ThroughputTest(
 //            serverIp: "127.0.0.1",
 //            serverPort: 1111,
