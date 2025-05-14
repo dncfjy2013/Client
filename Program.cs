@@ -10,20 +10,22 @@ using Client.Core.UdpClientClass.Protocal;
 using System.Net;
 using System.Security.Cryptography;
 
+SortedSet<int> sortedIntSet = new SortedSet<int>();
+
+var test = new ThroughputTest(
+            serverIp: "127.0.0.1",
+            serverPort: 1111,
+            clientCount: 1, // 50个并发客户端
+            messageCountPerClient: 1 // 每个客户端发送2000条消息
+        );
+await test.RunTestAsync();
+
+
+while (true) { }
 SSLClientInstance sSLClientInstance = new SSLClientInstance(true);
 await sSLClientInstance.ConnectAsync("127.0.0.1", 2222);
-while (true)
-{
 
-}
-//var test = new ThroughputTest(
-//            serverIp: "127.0.0.1",
-//            serverPort: 1111,
-//            clientCount: 50, // 50个并发客户端
-//            messageCountPerClient: 2000 // 每个客户端发送2000条消息
-//        );
 
-//await test.RunTestAsync();
 
 // 生成安全密钥（实际应使用安全随机数生成器）
 var encryptionKey = new byte[32];
@@ -67,22 +69,22 @@ await Task.WhenAll(sendTask, receiveTask);
 
 Console.WriteLine($"接收成功: ID={receiveTask.Result.Message.id}, 内容={receiveTask.Result.Message.message}");
 
-        
-//using (var clientInstance = new HttpClientInstance("http://localhost:9999/"))
-//{
-//    var getParameters = new Dictionary<string, string>
-//            {
-//                { "param1", "value1" },
-//                { "param2", "value2" }
-//            };
-//    await clientInstance.SendGetRequest(getParameters);
 
-//    await clientInstance.SendPostRequest("这是 POST 请求的数据", getParameters);
+using (var clientInstance = new Client.Core.HttpClientClass.HttpClientInstance("http://localhost:9999/"))
+{
+    var getParameters = new Dictionary<string, string>
+            {
+                { "param1", "value1" },
+                { "param2", "value2" }
+            };
+    await clientInstance.SendGetRequest(getParameters);
 
-//    await clientInstance.SendPutRequest("这是 PUT 请求的数据", getParameters);
+    await clientInstance.SendPostRequest("这是 POST 请求的数据", getParameters);
 
-//    await clientInstance.SendDeleteRequest(getParameters);
-//}
+    await clientInstance.SendPutRequest("这是 PUT 请求的数据", getParameters);
+
+    await clientInstance.SendDeleteRequest(getParameters);
+}
 
 
 //LargeFileTransferTest.Main();

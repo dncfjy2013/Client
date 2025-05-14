@@ -509,6 +509,7 @@ namespace Client.Core.SocketClientClass
             _heartbeatCts = new CancellationTokenSource();
             Task.Run(async () =>
             {
+                int num = 0;
                 try
                 {
                     while (!_heartbeatCts.IsCancellationRequested)
@@ -528,11 +529,15 @@ namespace Client.Core.SocketClientClass
                         {
                             Message = "Heartbeat",
                             InfoType = InfoType.HeartBeat,
-                            Priority = DataPriority.High
+                            Priority = DataPriority.High,
+                            SeqNum = num++,
                         };
-
+                        if (num == int.MaxValue)
+                        {
+                            num = 0;
+                        }
                         await SendRawData(heartbeatData);
-                        logger.LogInformation($"Heartbeat is sended, current id: {_heartbeatCountout}");
+                        logger.LogInformation($"Heartbeat is sended {num}");
                         Interlocked.Exchange(ref _isHeartAck, 0);
 
                         var ackTimeout = Task.Delay(AckTimeoutMs, _heartbeatCts.Token);
