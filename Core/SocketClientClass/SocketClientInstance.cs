@@ -12,6 +12,7 @@ namespace Client.Core.SocketClientClass
     // SocketClientInstance.cs - 客户端类
     public class SocketClientInstance
     {
+        #region 变量
         private readonly string _serverIp;
         private readonly int _port;
         private Socket _clientSocket;
@@ -30,13 +31,13 @@ namespace Client.Core.SocketClientClass
         private const int BufferReserve = 10;       // 动态调整缓冲区
         private readonly object _windowLock = new object();
         private const int WindowSize = 1000000; // 窗口大小
-        private readonly Dictionary<int, CommunicationData> _receiveBuffer = new(); // 接收缓冲区
+        private readonly SortedDictionary<int, CommunicationData> _receiveHighBuffer = new(); // 接收缓冲区
         private int _isHeartAck = 0;
         private CancellationTokenSource _receiveCts;
         private CancellationTokenSource _heartbeatCts;
         private const int HeartbeatIntervalMs = 3000;
         private const int AckTimeoutMs = 1000; // 原逻辑10*10ms=100ms，建议延长
-        private const int MaxMissedHeartbeats = 3; // 原100次约5分钟，建议缩短
+        private const int MaxMissedHeartbeats = 60; // 原100次约5分钟，建议缩短
                                                    // 新增优先级序列号管理
         private readonly Dictionary<DataPriority, int> _prioritySequences = new()
         {
@@ -50,27 +51,27 @@ namespace Client.Core.SocketClientClass
             { DataPriority.Medium, 1 },
             { DataPriority.Low, 1 }
         };
-        public readonly ConcurrentDictionary<DataPriority, RetryConfig> _retryConfigs = new()
+        private readonly ConcurrentDictionary<DataPriority, RetryConfig> _retryConfigs = new()
         {
             [DataPriority.High] = new RetryConfig
             {
                 MaxRetries = 5,
-                BaseDelayMs = 300,
-                BackoffFactor = 1.5,
+                BaseDelayMs = 1000,
+                BackoffFactor = 3,
                 PriorityWeight = 1.0f
             },
             [DataPriority.Medium] = new RetryConfig
             {
                 MaxRetries = 3,
-                BaseDelayMs = 500,
-                BackoffFactor = 2.0,
+                BaseDelayMs = 3000,
+                BackoffFactor = 5,
                 PriorityWeight = 0.7f
             },
             [DataPriority.Low] = new RetryConfig
             {
                 MaxRetries = 1,
-                BaseDelayMs = 1000,
-                BackoffFactor = 3.0,
+                BaseDelayMs = 8000,
+                BackoffFactor = 9,
                 PriorityWeight = 0.3f
             }
         };
@@ -82,15 +83,11 @@ namespace Client.Core.SocketClientClass
         };
         private readonly object _sequenceLock = new();
         // 新增字段记录已处理的中等优先级序列号
-        private readonly SortedSet<int> _processedMediumSeq = new();
         private readonly SortedDictionary<int, CommunicationData> _mediumBuffer = new();
-        private readonly HashSet<int> _processedMediumSeqs = new();
+        private readonly SortedSet<int> _processedMediumSeqs = new SortedSet<int>();
         private int _mediumWindowSize = 20; // 初始窗口大小
         private DateTime _lastWindowAdjustTime = DateTime.Now;
 
-        private readonly object _processedHighLock = new();
-        private readonly object _processedMediumLock = new();
-        private readonly object _processedLowLock = new();
         // ACK接收事件
         public event Action<int> AckReceived;
         // 初始化配置（示例）
@@ -105,6 +102,7 @@ namespace Client.Core.SocketClientClass
         // 新增文件传输相关字段
         private readonly ConcurrentDictionary<string, FileTransferSession> _fileTransfers = new();
         private readonly SemaphoreSlim _fileTransferSemaphore = new(Environment.ProcessorCount * 2);
+        #endregion
         public SocketClientInstance(string serverIp, int port)
         {
             _serverIp = serverIp;
@@ -142,7 +140,6 @@ namespace Client.Core.SocketClientClass
                 var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
                 while (await timer.WaitForNextTickAsync() && _isConnected)
                 {
-                    logger.LogInformation("Start CheckResend ......");
                     await ProcessRetriesByPriority(DataPriority.High);
                     await ProcessRetriesByPriority(DataPriority.Medium);
                     await ProcessRetriesByPriority(DataPriority.Low);
@@ -274,10 +271,15 @@ namespace Client.Core.SocketClientClass
                         var data = await ReceiveData(_receiveCts.Token);
                         if (data != null)
                         {
-                            Interlocked.Exchange(ref _isHeartAck, 1); // 原子操作
+                            if (data.InfoType == InfoType.HeartBeat)
+                            {
+                                Interlocked.Exchange(ref _isHeartAck, 1); // 原子操作
+                            }
+                            else
+                                _skipNextHeartbeat = true;
                             try
                             {
-                                logger.LogDebug($"Receive data {data.Priority} {data.SeqNum}, waiting process");
+                                logger.LogDebug($"Receive data {data.Priority} Seq: {data.SeqNum}, waiting process");
                                 ProcessReceivedData(data);
                             }
                             catch (Exception ex)
@@ -285,7 +287,6 @@ namespace Client.Core.SocketClientClass
                                 logger.LogError("Data processing failed");
                             }
                         }
-                        await Task.Delay(100, _receiveCts.Token);
                     }
                 }
                 catch (OperationCanceledException) { /* 正常取消 */ }
@@ -300,12 +301,6 @@ namespace Client.Core.SocketClientClass
         // 接收处理增强
         private void ProcessReceivedData(CommunicationData data)
         {
-            // 触发ACK事件
-            if (data.AckNum > 0)
-            {
-                AckReceived?.Invoke(data.AckNum);
-            }
-
             // 根据优先级处理数据
             switch (data.Priority)
             {
@@ -325,80 +320,80 @@ namespace Client.Core.SocketClientClass
 
         private void ProcessHighPriorityData(CommunicationData data)
         {
-            lock (_processedHighLock)
+            if(data.InfoType != InfoType.HeartBeat)
             {
-                if (!TryRemovePendingMessage(DataPriority.High, data.SeqNum))
-                {
-                    logger.LogTrace($"PendingMessage HIGH priority Seq={data.SeqNum}");
-                }
-                // 严格顺序处理
-                if (data.SeqNum == _priorityNextExpect[data.Priority]++)
-                {
-                    logger.LogInformation($"Processing HIGH priority Seq={data.SeqNum}");
-                    DeliverData(data);
-                    // 处理缓冲的后续包
-                    while (_receiveBuffer.TryGetValue(_priorityNextExpect[data.Priority], out var bufferedData))
-                    {
-                        if (bufferedData.SeqNum == _priorityNextExpect[data.Priority] + 1)
-                        {
-                            logger.LogInformation($"Processing buffered HIGH priority Seq={_priorityNextExpect[data.Priority]}");
-                            _receiveBuffer.Remove(_priorityNextExpect[data.Priority]);
-                            _priorityNextExpect[data.Priority]++;
-                            DeliverData(bufferedData);
-                        }
-                    }
-                }
-                else if (data.SeqNum > _priorityNextExpect[data.Priority])
-                {
-                    // 缓存乱序包
-                    _receiveBuffer[data.SeqNum] = data;
-                    logger.LogInformation($"Buffered HIGH priority Seq={data.SeqNum}");
-                }
-                // SeqNum < _nextExpectedSeq 的包视为重复包，忽略
+                AckReceived?.Invoke(data.AckNum);
             }
+            if (!TryRemovePendingMessage(DataPriority.High, data.AckNum))
+            {
+                logger.LogTrace($"PendingMessage HIGH priority Seq={data.AckNum}");
+            }
+            if(data.AckNum < _priorityNextExpect[data.Priority])
+            {
+                logger.LogTrace($"Duplicate High seq={data.AckNum}");
+                return;
+            }
+            // 严格顺序处理
+            if (data.AckNum == _priorityNextExpect[data.Priority]++)
+            {
+                logger.LogInformation($"Processing HIGH priority Seq={data.AckNum}");
+                DeliverData(data);
+                // 处理缓冲的后续包
+                while (_receiveHighBuffer.First().Key == _priorityNextExpect[data.Priority])
+                {
+                    logger.LogInformation($"Processing buffered HIGH priority Seq={_priorityNextExpect[data.Priority]}");
+                    _receiveHighBuffer.Remove(_priorityNextExpect[data.Priority]);
+                    _priorityNextExpect[data.Priority]++;
+                    DeliverData(data);
+                }
+            }
+            else
+            {
+                // 缓存乱序包
+                _receiveHighBuffer.TryAdd(data.AckNum, data);
+                logger.LogInformation($"Buffered HIGH priority Seq={data.AckNum}");
+            }
+            
         }
 
         private void ProcessMediumPriorityData(CommunicationData data)
         {
-            lock (_processedMediumLock)
+            if (!TryRemovePendingMessage(DataPriority.Medium, data.AckNum))
             {
-                TryRemovePendingMessage(DataPriority.Medium, data.SeqNum);
-                // 1. 重复数据包检查
-                if (_processedMediumSeqs.Contains(data.SeqNum))
-                {
-                    logger.LogInformation($"Duplicate MEDIUM seq={data.SeqNum}");
-                    return;
-                }
-
-                // 2. 立即发送ACK（无论是否处理）
-                SendMediumAck(data.SeqNum);
-
-                // 3. 动态窗口范围计算
-                int expected = _priorityNextExpect[DataPriority.Medium];
-                int windowStart = expected;
-                int windowEnd = expected + _mediumWindowSize;
-
-                // 4. 判断是否在动态窗口内
-                if (data.SeqNum >= windowStart && data.SeqNum <= windowEnd)
-                {
-                    ProcessInWindow(data, ref expected);
-                }
-                else
-                {
-                    // 5. 超出窗口则缓冲管理
-                    if (!_mediumBuffer.ContainsKey(data.SeqNum))
-                    {
-                        _mediumBuffer.Add(data.SeqNum, data);
-                        logger.LogInformation($"Buffered MEDIUM seq={data.SeqNum} (window:{windowStart}-{windowEnd})");
-                    }
-                }
-
-                // 6. 动态调整窗口大小
-                AdjustWindowSize();
+                logger.LogTrace($"PendingMessage Medium priority Seq={data.AckNum}");
+            }
+            // 1. 重复数据包检查
+            if (_processedMediumSeqs.First() > data.AckNum)
+            {
+                logger.LogTrace($"Duplicate MEDIUM seq={data.AckNum}");
+                return;
             }
 
+            // 3. 动态窗口范围计算
+            int expected = _priorityNextExpect[DataPriority.Medium];
+            int windowStart = expected;
+            int windowEnd = expected + _mediumWindowSize;
+
+            // 4. 判断是否在动态窗口内
+            if (data.AckNum >= windowStart && data.AckNum <= windowEnd)
+            {
+                ProcessInWindow(data, expected);
+            }
+            else
+            {
+                // 5. 超出窗口则缓冲管理
+                if (!_mediumBuffer.ContainsKey(data.AckNum))
+                {
+                    _mediumBuffer.Add(data.AckNum, data);
+                    logger.LogInformation($"Buffered MEDIUM seq={data.AckNum} (window:{windowStart}-{windowEnd})");
+                }
+            }
+
+            // 6. 动态调整窗口大小
+            AdjustWindowSize();
+
         }
-        private void ProcessInWindow(CommunicationData data, ref int expected)
+        private void ProcessInWindow(CommunicationData data, int expected)
         {
             // 标记为已处理
             _processedMediumSeqs.Add(data.SeqNum);
@@ -411,25 +406,33 @@ namespace Client.Core.SocketClientClass
             while (_processedMediumSeqs.Contains(expected))
             {
                 expected++;
+                RemoveLessThan(_processedMediumSeqs, expected);
             }
-            _priorityNextExpect[DataPriority.Medium] = expected;
+            _priorityNextExpect[DataPriority.Medium]++;
 
             // 处理缓冲区内可处理的数据包
-            ProcessBufferedData(ref expected);
+            ProcessBufferedData();
         }
+        public void RemoveLessThan(SortedSet<int> set, int threshold)
+        {
+            // 获取小于threshold的所有元素
+            var itemsToRemove = set.GetViewBetween(int.MinValue, threshold - 1).ToList();
 
-        private void ProcessBufferedData(ref int expected)
+            // 从原集合中移除这些元素
+            foreach (var item in itemsToRemove)
+            {
+                set.Remove(item);
+            }
+        }
+        private void ProcessBufferedData()
         {
             // 从缓冲区提取连续序列号
-            while (_mediumBuffer.TryGetValue(expected, out var bufferedData))
+            if (_mediumBuffer.First().Key == _priorityNextExpect[DataPriority.Medium])
             {
-                DeliverData(bufferedData);
-                _mediumBuffer.Remove(expected);
-                _processedMediumSeqs.Add(expected);
-                expected++;
-                logger.LogInformation($"Process buffered MEDIUM seq={expected - 1}");
+                var date = _mediumBuffer.First().Value;
+                _mediumBuffer.Remove(_mediumBuffer.First().Key);
+                ProcessInWindow(date, _priorityNextExpect[DataPriority.Medium]);
             }
-            _priorityNextExpect[DataPriority.Medium] = expected;
         }
 
         private void AdjustWindowSize()
@@ -468,33 +471,15 @@ namespace Client.Core.SocketClientClass
             return processedCount / 10.0;
         }
 
-        private async void SendMediumAck(int seqNum)
-        {
-            try
-            {
-                var ack = new CommunicationData
-                {
-                    AckNum = seqNum,
-                    Priority = DataPriority.High,
-                };
-                await SendRawData(ack);
-            }
-            catch (Exception ex)
-            {
-                logger.LogError($"MEDIUM ACK发送失败 seq={seqNum}: {ex.Message}");
-                // 失败重试机制
-                _ = Task.Delay(100).ContinueWith(_ => SendMediumAck(seqNum));
-            }
-        }
-
         private void ProcessLowPriorityData(CommunicationData data)
         {
-            lock (_processedLowLock)
+            if(!TryRemovePendingMessage(DataPriority.Low, data.AckNum))
             {
-                // 低优先级：直接处理，不保证顺序
-                logger.LogInformation($"Processing LOW priority Seq={data.SeqNum}");
-                DeliverData(data);
+                logger.LogTrace($"PendingMessage Low priority Seq={data.AckNum}");
             }
+            // 低优先级：直接处理，不保证顺序
+            logger.LogInformation($"Processing LOW priority Seq={data.SeqNum}");
+            DeliverData(data);
         }
 
         private void DeliverData(CommunicationData data)
@@ -511,7 +496,8 @@ namespace Client.Core.SocketClientClass
                     {
                         InfoType = data.InfoType,
                         AckNum = data.SeqNum,
-                        Priority = DataPriority.High // ACK使用高优先级
+                        Priority = data.Priority, // ACK使用高优先级
+                        Message = "Ack"
                     };
                     await SendRawData(ack);
                 });
@@ -545,7 +531,8 @@ namespace Client.Core.SocketClientClass
                             Priority = DataPriority.High
                         };
 
-                        await SendData(heartbeatData);
+                        await SendRawData(heartbeatData);
+                        logger.LogInformation($"Heartbeat is sended, current id: {_heartbeatCountout}");
                         Interlocked.Exchange(ref _isHeartAck, 0);
 
                         var ackTimeout = Task.Delay(AckTimeoutMs, _heartbeatCts.Token);
@@ -615,12 +602,6 @@ namespace Client.Core.SocketClientClass
                 {
                     await SendRawData(data);
                     logger.LogInformation($"Sent: {data.InfoType}, Seq={data.SeqNum}, Pri={data.Priority}");
-
-                    // 高优先级数据需要等待ACK或重试
-                    if (data.Priority == DataPriority.High)
-                    {
-                        await WaitForAck(data.SeqNum, data.Priority);
-                    }
                 }
                 catch (Exception ex)
                 {
@@ -833,7 +814,7 @@ namespace Client.Core.SocketClientClass
                 logger.LogDebug($"Sent {sent} bytes, total sent: {totalSent}");
             }
 
-            logger.LogInformation($"Data sent successfully, total length: {protocolBytes.Length}");
+            logger.LogTrace($"Data sent successfully, total length: {protocolBytes.Length}");
             return true;
         }
         // 修改 ReceiveData 方法
